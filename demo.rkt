@@ -16,8 +16,11 @@
   (define-values (c v) (compile+eval-expression e))
   (when check-val
     (unless (equal? v check-val)
+      (printf "c ~v\n\nv ~v\n\n" c v)
+      (printf "expanded   ~v\n" (expand (namespace-syntax-introduce (datum->syntax e))))
       (error "check failed")))
   v)
+
 
 (compile+eval-expression
  '(lambda (x) x))
@@ -81,12 +84,14 @@
 "distinct generated variables via introduction scope"
 ;; Essentially the same as
 ;;   (define-syntax-rule (gen2 _ x1 x2 v1 v2)
-;;     (let ([x1 v1]
-;;           [v2 v2])
-;;       (list x1 x2)))
+;;     (let ([x1 v1])
+;;       (let ([x2 v2])
+;;         (list x1 x2)))))
 ;;   (define-syntax-rule (gen1 next . rest)
 ;;     (next gen2 x . rest)) ; <- `x` twice in final expansion
 ;;   (gen1 gen1 1 2)
+;;=> (gen1 gen2 x 1 2)
+;;=> (gen2 gen2 x x 1 2)
 ;; to check that the two introduced instances of `x` are
 ;; not `bound-identifier=?`
 (eval-expression
