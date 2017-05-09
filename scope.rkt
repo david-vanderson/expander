@@ -1,79 +1,142 @@
 #lang racket/base
-(require racket/set
-         racket/list
-         "syntax.rkt")
+(require "syntax.rkt")
 
-(provide new-scope
-         add-scope
-         flip-scope
-         
-         add-binding!
-         resolve)
+(provide resolve
+         bound-identifier=?
+         free-identifier=?
 
-;; A scope represents a distinct "dimension" of binding.
-;; Scope identity is `eq?` identity.
+         (struct-out tip)
+         (struct-out bind)
+         syntax-tip
+         tip-extend!
+         tip-pop!
+         freeze
+         mark
+         thaw-introduced)
 
-(struct scope ())
+;; Each syntax object has as pointer (for each phase) to the
+;; binding branch tip that represents bindings that affect it.
 
-(define (new-scope) (scope))
+;; As we expand, we add bindings imperitively to the tip, and
+;; any un-expanded syntax using that tip sees the new bindings.
 
-;; Add or flip a scope everywehere (i.e., including nested syntax)
-(define (adjust-scope s/e sc op)
+;; As each syntax is expanded, we freeze its tips so it will no
+;; longer see new bindings.
+
+;; For each macro invocation, we take introduced syntax and thaw
+;; it to a new tip.  This creates the extra dimension of binding
+;; that hygiene requires.
+
+
+;; A branch represents a single binding and points to the
+;; previous branch that this binding extends
+
+;; type 'var  -> val is gensym for local variable
+;; type 'form -> val is core form
+;; type 'prim -> val is core primitive
+;; type 'stx  -> val is procedure? for macro, else syntax error
+
+(struct bind (type val)
+  #:transparent)
+
+(struct branch (id       ; symbol
+                binding  ; bind struct
+                prev)    ; #f or branch that this branch extends
+  #;#:transparent)
+
+
+;; A tip holds a branch and is mutable so the branch can be
+;; extended at the front
+;; it is unique to a given phase
+(struct tip (id       ; unique id or 'frozen
+             phase    ; integer
+             branch)  ; pointer to first branch
+  #:transparent #:mutable)
+
+
+(define (syntax-tip s phase (err? #f))
+  (define t (findf (lambda (t) (= phase (tip-phase t))) (syntax-tips s)))
+  (when (and err? (not t))
+    (error "can't find a tip with phase:" phase s))
+  t)
+
+
+(define (bound-identifier=? a b phase)
+  (let ((ta (syntax-tip a phase))
+        (tb (syntax-tip b phase)))
+    (and (eq? (syntax-e a) (syntax-e b))
+         ta tb  ; must have tips
+         (eq? ta tb))))
+
+
+(define (free-identifier=? a b phase)
+  (eq? (resolve a phase) (resolve b phase)))
+
+
+(define (resolve id phase (err? #f))
+  (let loop ((b (tip-branch (syntax-tip id phase #t))))
+    (cond
+      ((not b)  ; ran out of branches
+       (if err?
+           (error "unbound identifier in phase:" phase id)
+           #f))
+      ((equal? (syntax-e id) (branch-id b))  ; found it
+       (branch-binding b))
+      (else
+       (loop (branch-prev b))))))
+
+
+;; add to this tip's branch
+(define (tip-extend! t id bind-type bind-val)
+  (set-tip-branch! t (branch id (bind bind-type bind-val) (tip-branch t))))
+
+;; remove most recent binding
+(define (tip-pop! t)
+  (set-tip-branch! t (branch-prev (tip-branch t))))
+
+;; copy all the tips so this syntax won't be bound be future bindings
+(define (freeze s)
   (cond
-   [(syntax? s/e) (struct-copy syntax s/e
-                               [e (adjust-scope (syntax-e s/e) sc op)]
-                               [scopes (op (syntax-scopes s/e) sc)])]
-   [(list? s/e) (map (lambda (s) (adjust-scope s sc op)) s/e)]
-   [else s/e]))
+    [(syntax? s)
+     (syntax (freeze (syntax-e s)) (syntax-mark s)
+             (map (lambda (t) (tip 'frozen (tip-phase t) (tip-branch t)))
+                  (syntax-tips s)))]
+    [(list? s) (map freeze s)]
+    [else s]))
 
-(define (add-scope s sc)
-  (adjust-scope s sc set-add))
-
-(define (set-flip s e)
-  (if (set-member? s e)
-      (set-remove s e)
-      (set-add s e)))
-
-(define (flip-scope s sc)
-  (adjust-scope s sc set-flip))
-
-;; ----------------------------------------
-
-;; Global table of bindings
-(define all-bindings
-  (make-hash))
-
-(define (add-binding! id binding)
-  (unless (identifier? id)
-    (raise-argument-error 'resolve "identifier?" id))
-  (hash-set! all-bindings id binding))
-
-;; Finds the binding for a given identifier; returns #f if the
-;; identifier is unbound
-(define (resolve id)
-  (define candidate-ids (find-all-matching-bindings id))
+;; set a mark on all syntax going into a macro
+(define (mark s)
   (cond
-   [(pair? candidate-ids)
-    (define max-candidate-id
-      (argmax (lambda (c-id) (set-count (syntax-scopes c-id)))
-              candidate-ids))
-    (check-unambiguous max-candidate-id candidate-ids id)
-    (hash-ref all-bindings max-candidate-id)]
-   [else #f]))
+    [(syntax? s)
+     (syntax (mark (syntax-e s)) #t (syntax-tips s))]
+    [(list? s) (map mark s)]
+    [else s]))
 
-;; Find all candidiate bindings for `id` as the ones with
-;; a subset of the scopes of `id`
-(define (find-all-matching-bindings id)
-  (for/list ([(c-id) (in-hash-keys all-bindings)]
-             #:when (and (eq? (syntax-e c-id) (syntax-e id))
-                         (subset? (syntax-scopes c-id) (syntax-scopes id))))
-    c-id))
+;; thaw all macro-introduced syntax (mark is #f), leave other syntax alone
+;; all introduced syntax that was on the same tip when frozen will end
+;; up on the same new tip
+(define (thaw-introduced s phase)
+  (define newtips (make-hasheq))
+  (let thaw-introduced* ((s s))
+    (cond
+      [(and (syntax? s) (not (syntax-mark s)))
+       ; introduced syntax, make a new branch
+       (define t (syntax-tip s phase #t))
+       (unless (equal? 'frozen (tip-id t))
+         (error "trying to thaw unfrozen tip" s))
+       (define nt (hash-ref newtips (tip-branch t) 'notfound))
+       (case nt
+         [(notfound)
+          (set! nt (tip (gensym 'tip) phase (tip-branch t)))
+          ; map old branch to new tip
+          (hash-set! newtips (tip-branch t) nt)])
 
-;; Check that the binding with the biggest scope set is a superset
-;; of all the others
-(define (check-unambiguous max-candidate-id candidate-ids error-id)
-  (for ([c-id (in-list candidate-ids)])
-    (unless (subset? (syntax-scopes c-id)
-                     (syntax-scopes max-candidate-id))
-      (error "ambiguous:" error-id))))
+       (when (identifier? s)
+         (printf "thaw adding ~a to ~a\n" (tip-id nt) (syntax-e s)))
+       (syntax (thaw-introduced* (syntax-e s)) #f (cons nt (remove t (syntax-tips s))))]
+      [(and (syntax? s) (syntax-mark s))
+       ; not introduced, just reset mark
+       (syntax (thaw-introduced* (syntax-e s)) #f (syntax-tips s))]
+      [(list? s) (map thaw-introduced* s)]
+      [else s])))
 
