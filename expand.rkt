@@ -1,25 +1,36 @@
 #lang racket/base
-(require racket/set
-         racket/unit
-         "syntax.rkt"
+(require "syntax.rkt"
          "scope.rkt"
          "match.rkt"
-         "namespace.rkt"
-         "binding.rkt"
-         "dup-check.rkt"
+         ;"namespace.rkt"
+         ;"dup-check.rkt"
          "compile.rkt"
-         "core.rkt"
-         "expand-context.rkt")
+         ;"core.rkt"
+         "expand-context.rkt"
+         )
 
 (provide expand
          expand-body
-         lookup
          
          expand+eval-for-syntaxes-binding
          eval-for-syntaxes-binding
          eval-for-bindings
-         
+
+         new-core-tip
+         literal
          rebuild)
+
+
+;; pass output of this into introduce
+(define (new-core-tip phase coret)
+  (tip (gensym 'tipcore) phase (tip-branch coret)))
+
+;; helper to create an identifier that always refers to the core form
+(define (literal sym ctx)
+  (define phase (expand-context-phase ctx))
+  (freeze (introduce (datum->syntax #f sym)
+                     phase
+                     (new-core-tip phase (expand-context-coret ctx)))))
 
 ;; ----------------------------------------
 
@@ -42,275 +53,274 @@
 
 ;; An identifier by itself:
 (define (expand-identifier s ctx)
-  (define binding (resolve s))
+  (define binding (resolve s (expand-context-phase ctx)))
   (cond
    [(not binding)
     ;; The implicit `#%top` form handles unbound identifiers
     (expand-implicit '#%top s ctx)]
-   [else
-    ;; Variable or form as identifier macro
-    (dispatch (lookup binding ctx s) s ctx)]))
+   [(or (equal? 'prim (bind-type binding))
+        (equal? 'var (bind-type binding)))
+    (if (expand-context-only-immediate? ctx)
+        s  ;; don't freeze here, just rearranging for internal definition context
+        (freeze s))]
+   [(equal? 'form (bind-type binding))
+    (if (expand-context-only-immediate? ctx)
+        s  ;; don't freeze here, just rearranging for internal definition context
+        ((bind-val binding) s ctx))]
+   [(equal? 'stx (bind-type binding))
+    (if (procedure? (bind-val binding))
+        (expand (apply-transformer (bind-val binding) s ctx) ctx)
+        (error "illegal use of syntax:" s))]))
 
 ;; An "application" form that starts with an identifier
 (define (expand-id-application-form s ctx)
   (define id (car (syntax-e s)))
-  (define binding (resolve id))
+  (define binding (resolve id (expand-context-phase ctx)))
   (cond
-   [(not binding)
-    ;; The `#%app` binding might do something with unbound ids
+   [(or (not binding)
+        (equal? 'var (bind-type binding))
+        (equal? 'prim (bind-type binding)))
     (expand-implicit '#%app s ctx)]
-   [else
-    ;; Find out whether it's bound as a variable, syntax, or core form
-    (define t (lookup binding ctx id))
-    (cond
-     [(variable? t)
-      ;; Not as syntax or core form, so use implicit `#%app`
-      (expand-implicit '#%app s ctx)]
-     [else
-      ;; Syntax or core form as "application"
-      (dispatch t s ctx)])]))
+   [(equal? 'form (bind-type binding))
+    (if (expand-context-only-immediate? ctx)
+        s  ;; don't freeze here, just rearranging for internal definition context
+        ((bind-val binding) s ctx))]
+   [(equal? 'stx (bind-type binding))
+    (if (procedure? (bind-val binding))
+        (expand (apply-transformer (bind-val binding) s ctx) ctx)
+        (error "illegal use of syntax:" s))]))
   
 ;; Handle an implicit: `#%app`, `#%top`, or `#%datum`
 (define (expand-implicit sym s ctx)
-  (define id (datum->syntax s sym))
+  (define id (datum->syntax s sym s s))
   ;; Instead of calling `expand` with a new form that starts `id`,
-  ;; we implement the "applicaiton"-form case of `expand` so that
+  ;; we implement the "application"-form case of `expand` so that
   ;; we provide an error if the implicit form is not suitably bound
-  (define b (resolve id))
-  (define t (and b (lookup b ctx id)))
+  (define b (resolve id (expand-context-phase ctx)))
   (cond
-   [(core-form? t)
+   [(and b (equal? 'form (bind-type b)))
     (if (expand-context-only-immediate? ctx)
-        s
-        (dispatch t (datum->syntax s (cons sym s) s) ctx))]
-   [(transformer? t)
-    (dispatch t (datum->syntax s (cons sym s) s) ctx)]
+        s  ;; don't freeze here, just rearranging for internal definition context
+        (expand (datum->syntax s (cons id s) s s) ctx))]
+   [(and b
+         (equal? 'stx (bind-type b))
+         (procedure? (bind-val b)))
+    (expand (apply-transformer (bind-val b) (datum->syntax s (cons id s) s s) ctx) ctx)]
    [else
     (error (format "no transformer binding for ~a:" sym)
            s)]))
 
-;; Expand `s` given that the value `t` of the relevant binding,
-;; where `t` is either a core form, a macro transformer, some
-;; other compile-time value (which is an error), or a token
-;; indincating that the binding is a run-time variable
-(define (dispatch t s ctx)
-  (cond
-   [(core-form? t)
-    (if (expand-context-only-immediate? ctx)
-        s
-        ((core-form-expander t) s ctx))]
-   [(transformer? t)
-    ;; Apply transformer and expand again
-    (expand (apply-transformer t s ctx) ctx)]
-   [(variable? t)
-    ;; A reference to a variable expands to itself
-    s]
-   [else
-    ;; Some other compile-time value:
-    (error "illegal use of syntax:" t)]))
-
 ;; Given a macro transformer `t`, apply it --- adding appropriate
 ;; scopes to represent the expansion step
 (define (apply-transformer t s ctx)
-  (define intro-scope (new-scope))
-  (define intro-s (add-scope s intro-scope))
-  ;; In a definition context, we need use-site scopes
-  (define use-s (maybe-add-use-site-scope intro-s ctx))
+  ;; Mark given syntax
+  (define marked-s (mark s))
   ;; Call the transformer
-  (define transformed-s (t use-s))
+  ;(printf "before t: ~v\n\n" marked-s)
+  (define transformed-s (t marked-s))
   (unless (syntax? transformed-s)
     (error "transformer produced non-syntax:" transformed-s))
-  (define result-s (flip-scope transformed-s intro-scope))
-  ;; In a definition contex, we need to add the inside-edge scope to
-  ;; any expansion result
-  (maybe-add-post-expansion-scope result-s ctx))
-
-(define (maybe-add-use-site-scope s ctx)
-  (cond
-   [(expand-context-use-site-scopes ctx)
-    ;; We're in a recursive definition context where use-site scopes
-    ;; are needed, so create one, record it, and add to the given
-    ;; syntax
-    (define sc (new-scope))
-    (define b (expand-context-use-site-scopes ctx))
-    (set-box! b (cons sc (unbox b)))
-    (add-scope s sc)]
-   [else s]))
-
-(define (maybe-add-post-expansion-scope s ctx)
-  (cond
-   [(expand-context-post-expansion-scope ctx)
-    ;; We're in a definition context where an inside-edge scope needs
-    ;; to be added to any immediate macro expansion; that way, if the
-    ;; macro expands to a definition form, the binding will be in the
-    ;; definition context's scope
-    (add-scope s (expand-context-post-expansion-scope ctx))]
-   [else s]))
-
-;; Helper to lookup a binding in an expansion context
-(define (lookup b ctx id)
-  (binding-lookup b
-                  (expand-context-env ctx)
-                  (expand-context-namespace ctx)
-                  id))
+  ;(printf "after t: ~v\n\n" t-s)
+  (define after-s (thaw-introduced transformed-s (expand-context-phase ctx)))
+  ;(printf "after b: ~v\n\n" after-s)
+  after-s)
 
 ;; ----------------------------------------
 
 ;; Expand a sequence of body forms in a definition context
-(define (expand-body bodys sc s ctx)
-  ;; The outside-edge scope identifies the original content of the
-  ;; definition context
-  (define outside-sc (new-scope))
-  ;; The inside-edge scope identifiers any form that appears (perhaps
-  ;; through macro expansion) in the definition context
-  (define inside-sc (new-scope))
-  (define init-bodys
-    (for/list ([body (in-list bodys)])
-      (add-scope (add-scope (add-scope body sc) outside-sc) inside-sc)))
+(define (expand-body s bodys ctx)
   ;; Create an expansion context for expanding only immediate macros;
   ;; this partial-expansion phase uncovers macro- and variable
   ;; definitions in the definition context
   (define body-ctx (struct-copy expand-context ctx
                                 [only-immediate? #t]
-                                [post-expansion-scope inside-sc]
-                                [use-site-scopes (box null)]))
-  (let loop ([body-ctx body-ctx]
-             [bodys init-bodys]
+                                [record-tips (box null)]))
+  (let loop ([bodys bodys]
              [done-bodys null] ; accumulated expressions
              [val-binds null]  ; accumulated bindings
-             [dups (make-check-no-duplicate-table)])
+             [old-tips null])   ; tips we need to pop at the end
     (cond
      [(null? bodys)
       ;; Partial expansion is complete, so finish by rewriting to
       ;; `letrec-values`
-      (finish-expanding-body body-ctx done-bodys val-binds s)]
+      (finish-expanding-body body-ctx done-bodys val-binds s old-tips)]
      [else
       (define exp-body (expand (car bodys) body-ctx))
-      (case (core-form-sym exp-body)
-        [(begin)
-         ;; Splice a `begin` form
-         (define m (match-syntax exp-body '(begin e ...)))
-         (loop body-ctx
-               (append (m 'e) (cdr bodys))
-               done-bodys
+      ;; because of the partial expand, exp-body will be:
+      ;; a list where the first identifier is a core form
+      ;; an identifier that is a variable, primitive, or core form
+      (define id (if (pair? (syntax-e exp-body))
+                     (car (syntax-e exp-body))
+                     exp-body))
+      (printf "resolving ~v\n\n" id)
+      (define b (resolve id (expand-context-phase body-ctx)))
+      (cond
+        [(or (not b)  ; var we haven't found the binding to yet
+             (equal? 'var (bind-type b))
+             (equal? 'prim (bind-type b)))
+         (printf "var/prim ~v\n\n" exp-body)
+         ;; Found a var or primitive; accumulate it and continue
+         (loop (cdr bodys)
+               (append done-bodys (list exp-body))
                val-binds
-               dups)]
-        [(define-values)
-         ;; Found a variable definition; add bindings, extend the
-         ;; environment, and continue
-         (define m (match-syntax exp-body '(define-values (id ...) rhs)))
-         (define ids (remove-use-site-scopes (m 'id) body-ctx))
-         (define new-dups (check-no-duplicate-ids ids exp-body dups))
-         (define keys (for/list ([id (in-list ids)])
-                        (add-local-binding! id)))
-         (define extended-env (for/fold ([env (expand-context-env body-ctx)]) ([key (in-list keys)])
-                                (env-extend env key variable)))
-         (loop (struct-copy expand-context body-ctx
-                            [env extended-env])
-               (cdr bodys)
-               null
-               (cons (list ids (m 'rhs))
-                     ;; If we had accumulated some expressions, we
-                     ;; need to turn each into a
-                     ;;  (defined-values () (begin <expr> (values)))
-                     ;; form so it can be kept with definitions to
-                     ;; preserved order
-                     (append
-                      (for/list ([done-body (in-list done-bodys)])
-                        (no-binds done-body s))
-                      val-binds))
-               new-dups)]
-        [(define-syntaxes)
-         ;; Found a macro definition; add bindings, evaluate the
-         ;; compile-time right-hand side, install the compile-time
-         ;; values in the environment, and continue
-         (define m (match-syntax exp-body '(define-syntaxes (id ...) rhs)))
-         (define ids (remove-use-site-scopes (m 'id) body-ctx))
-         (define new-dups (check-no-duplicate-ids ids exp-body dups))
-         (define keys (for/list ([id (in-list ids)])
-                        (add-local-binding! id)))
-         (define vals (eval-for-syntaxes-binding (m 'rhs) ids ctx))
-         (define extended-env (for/fold ([env (expand-context-env body-ctx)]) ([key (in-list keys)]
-                                                                               [val (in-list vals)])
-                                (env-extend env key val)))
-         (loop (struct-copy expand-context body-ctx
-                            [env extended-env])
-               (cdr bodys)
-               done-bodys
-               val-binds
-               new-dups)]
+               old-tips)]
         [else
-         ;; Found an expression; accumulate it and continue
-         (loop body-ctx
-               (cdr bodys)
-               (cons exp-body done-bodys)
-               val-binds
-               dups)])])))
+         (case (syntax-e id)
+           [(begin)
+            ;; Splice a `begin` form
+            (printf "splicing begin\n\n")
+            (define m (match-syntax exp-body '(begin e ...)))
+            (loop (append (m 'e) (cdr bodys))
+                  done-bodys
+                  val-binds
+                  old-tips)]
+           [(define-values)
+            ;; Found a variable definition
+            (define m (match-syntax exp-body '(define-values (id ...) rhs)))
+            (define ids
+              (for/list ([id (in-list (m 'id))])
+                ;; Get the tip from the binding variable
+                (define t (syntax-tip id (expand-context-phase body-ctx) #t))
+                (define sym (syntax-e id))
+                ;; Add the new binding
+                (printf "define-values binding ~a\n\n" sym)
+                (tip-extend! t sym 'var (gensym sym))
+                ;; save this old tip before we freeze so we can pop it later
+                (set! old-tips (cons t old-tips))
+                ;; Freeze binding branch on id
+                (freeze id)))
+            (loop (cdr bodys)
+                  null
+                  (append val-binds
+                        ;; If we had accumulated some expressions, we
+                        ;; need to turn each into a
+                        ;;  (defined-values () (begin <expr> (values)))
+                        ;; form so it can be kept with definitions to
+                        ;; preserved order
+                          (for/list ([done-body (in-list done-bodys)])
+                            (no-binds done-body s body-ctx))
+                          (list (list ids (m 'rhs))))
+                  old-tips)]
+           [(define-syntaxes)
+            (printf "define-syntaxes\n\n")
+            ;; Found a macro definition, this is the tricky one
+            ;; We have to expand+eval the definition in case a further use
+            ;; expands to more defines in this same definition context.
+            ;; But the macro-introduced syntax can also be bound by definitions
+            ;; we haven't seen yet.
+            ;; This case is signaled by a non-#f record-tips in the expand-context.
+            ;; - quote-syntax will only do a partial freeze that points the new frozen
+            ;;   tips to the tips being replaced (so the syntax will be bound by further
+            ;;   defines in this definition context)
+            ;;   - we add each new tip to record-tips
+            ;; - thaw-introduced branches like normal, but tips can still point to other tips
+            ;;   - we add each new tip to record-tips
+            ;; - after all definition context bindings are found and added to their chains,
+            ;;   we run down all chains in record-tips and snip out non-head tips
+            ;;   - this freezes anything that was partially frozen before
+            (define m (match-syntax exp-body '(define-syntaxes (id ...) rhs)))
+            (define ids
+              (for/list ([id (in-list (m 'id))])
+                ;; Get the tip from the binding variable
+                (define t (syntax-tip id (expand-context-phase body-ctx) #t))
+                (define sym (syntax-e id))
+                ;; Add the new binding with a placeholder so it can be recursive
+                (tip-extend! t sym 'stx #f)
+                ;; save this old tip before we freeze so we can pop it later
+                (set! old-tips (cons t old-tips))
+                ;; Freeze binding branch on id
+                (freeze id)))
+            
+            (define transformers
+              (eval-for-syntaxes-binding (m 'rhs) ids body-ctx))
+            
+            ;; patch up the placeholder
+            (for ([id (in-list ids)]
+                  [trans (in-list transformers)])
+              (define binding (resolve id (expand-context-phase body-ctx) #t))
+              (set-bind-val! binding trans))
+            
+            (loop (cdr bodys)
+                  done-bodys
+                  val-binds
+                  old-tips)]
+           [else
+            (printf "expression ~v\n\n" exp-body)
+            ;; Found an expression; accumulate it and continue
+            (loop (cdr bodys)
+                  (append done-bodys (list exp-body))
+                  val-binds
+                  old-tips)])])])))
 
 ;; Partial expansion is complete, so assumble the result as a
 ;; `letrec-values` form and continue expanding
-(define (finish-expanding-body body-ctx done-bodys val-binds s)
+(define (finish-expanding-body body-ctx done-bodys val-binds s old-tips)
   (when (null? done-bodys)
-    (error "no body forms:" s))
+    (error "definition context didn't end with expression:" s))
+
+  ;; done with all the binding, deal with record-tips
+  (for ([tip (in-list (unbox (expand-context-record-tips body-ctx)))])
+    (snip-tips! tip))
+  
   ;; As we finish expanding, we're no longer in a definition context
   (define finish-ctx (struct-copy expand-context body-ctx
-                                  [use-site-scopes #f]
                                   [only-immediate? #f]
-                                  [post-expansion-scope #f]))
+                                  [record-tips #f]))
   ;; Helper to expand and wrap the ending expressions in `begin`, if needed:
   (define (finish-bodys)
     (cond
-     [(null? (cdr done-bodys))
+     [(null? (cdr done-bodys))      
       (expand (car done-bodys) finish-ctx)]
      [else
-      (datum->syntax
-       #f
-       `(,(datum->syntax core-stx 'begin)
-         ,@(for/list ([body (in-list done-bodys)])
-             (expand body finish-ctx)))
-       s)]))
-  (cond
-   [(null? val-binds)
-    ;; No definitions, so no `letrec-values` wrapper needed:
-    (finish-bodys)]
-   [else
-    ;; Add `letrec-values` wrapper, finish expanding the right-hand
-    ;; sides, and then finish the body expression:
-    (datum->syntax
-     #f
-     `(,(datum->syntax core-stx 'letrec-values)
-       ,(for/list ([bind (in-list (reverse val-binds))])
-          `(,(datum->syntax #f (car bind)) ,(expand (cadr bind) finish-ctx)))
-       ,(finish-bodys))
-     s)]))
+      (rebuild s
+               `(,(literal 'begin finish-ctx)
+                 ,@(for/list ([body (in-list done-bodys)])
+                     (expand body finish-ctx))))]))
+
+  (define exp-bodys
+    (freeze
+     (cond
+       [(null? val-binds)
+        ;; No definitions, so no `letrec-values` wrapper needed:
+        (finish-bodys)]
+       [else
+        ;; Add `letrec-values` wrapper, finish expanding the right-hand
+        ;; sides, and then finish the body expression:
+        (rebuild s
+                 `(,(literal 'letrec-values finish-ctx)
+                   ,(for/list ([bind (in-list val-binds)])
+                      `(,(datum->syntax #f (car bind)) ,(expand (cadr bind) finish-ctx)))
+                   ,(finish-bodys)))])))
+
+  ;; done expanding, pop all old-tips
+  (for ([t (in-list old-tips)])
+    (tip-pop! t))
+
+  exp-bodys)
 
 ;; Helper to turn an expression into a binding clause with zero
 ;; bindings
-(define (no-binds expr s)
+(define (no-binds expr s ctx)
   (list null (datum->syntax #f
-                            `(,(datum->syntax core-stx 'begin)
+                            `(,(literal 'begin ctx)
                               ,expr
-                              (,(datum->syntax core-stx '#%app)
-                               ,(datum->syntax core-stx 'values)))
+                              (,(literal '#%app ctx)
+                               ,(literal 'values ctx)))
                             s)))
 
-;; Helper to remove any created use-site scopes from the left-hand
-;; side of a definition that was revealed by partial expansion in a
-;; definition context
-(define (remove-use-site-scopes s ctx)
-  (remove-scopes s (unbox (expand-context-use-site-scopes ctx))))
 
 ;; ----------------------------------------
 
 ;; Expand `s` as a compile-time expression relative to the current
 ;; expansion context
 (define (expand-transformer s ctx)
-  (expand s (struct-copy expand-context ctx
-                         [env empty-env]
-                         [only-immediate? #f]
-                         [post-expansion-scope #f])))
+  (define phase (+ (expand-context-phase ctx) 1))
+  (expand (introduce s phase (new-core-tip phase (expand-context-coret ctx)))
+          (struct-copy expand-context ctx
+                       [phase phase]
+                       [only-immediate? #f])))
 
-;; Expand and evaluate `s` as a compile-time expression, ensuring that
+;; Expand and evaluate `rhs` as a compile-time expression, ensuring that
 ;; the number of returned values matches the number of target
 ;; identifiers; return the expanded form as well as its values
 (define (expand+eval-for-syntaxes-binding rhs ids ctx)
@@ -318,9 +328,10 @@
   (values exp-rhs
           (eval-for-bindings ids
                              exp-rhs
+                             (+ (expand-context-phase ctx) 1)
                              (expand-context-namespace ctx))))
 
-;; Expand and evaluate `s` as a compile-time expression, returning
+;; Expand and evaluate `rhs` as a compile-time expression, returning
 ;; only the compile-time values
 (define (eval-for-syntaxes-binding rhs ids ctx)
   (define-values (exp-rhs vals)
@@ -330,8 +341,8 @@
 ;; Expand and evaluate `s` as an expression in the given phase;
 ;; ensuring that the number of returned values matches the number of
 ;; target identifiers; return the values
-(define (eval-for-bindings ids s ns)
-  (define compiled (compile s ns))
+(define (eval-for-bindings ids s phase ns)
+  (define compiled (compile s phase ns))
   (define vals
     (call-with-values (lambda () (expand-time-eval `(#%expression ,compiled)))
       list))
@@ -340,8 +351,8 @@
            "from" s))
   vals)
 
-;; ----------------------------------------
 
+;; ----------------------------------------
 ;; A helper for forms to reconstruct syntax
 (define (rebuild orig-s new)
   (datum->syntax orig-s new orig-s orig-s))

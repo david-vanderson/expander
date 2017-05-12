@@ -2,8 +2,9 @@
 
 (provide
  (struct-out syntax) ; includes `syntax?` and `syntax-e`
- empty-syntax
  identifier?
+
+ empty-tips
  
  syntax->datum
  datum->syntax
@@ -11,7 +12,8 @@
  syntax-property)
 
 (struct syntax (e      ; datum and nested syntax objects
-                scopes ; scopes that apply at all phases
+                mark   ; #t or #f to distinguish introduced syntax
+                tips   ; list of tips, one for each phase
                 srcloc ; source location
                 props) ; properties
         ;; Custom printer:
@@ -21,11 +23,8 @@
           (fprintf port "~.s" (syntax->datum s))
           (write-string ">" port)))
 
-(define empty-scopes (seteq))
+(define empty-tips (list))
 (define empty-props #hash())
-
-(define empty-syntax
-  (syntax #f empty-scopes #f empty-props))
 
 (define (identifier? s)
   (and (syntax? s) (symbol? (syntax-e s))))
@@ -40,10 +39,10 @@
 
 (define (datum->syntax stx-c v [stx-l #f] [stx-p #f])
   (define (wrap e)
-    (syntax e
+    (syntax e #f
             (if stx-c
-                (syntax-scopes stx-c)
-                empty-scopes)
+                (syntax-tips stx-c)
+                empty-tips)
             (and stx-l (syntax-srcloc stx-l))
             (if stx-p (syntax-props stx-p) empty-props)))
   (cond

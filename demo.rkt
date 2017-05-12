@@ -7,8 +7,9 @@
   (expand (namespace-syntax-introduce (datum->syntax #f e))))
 
 (define (compile+eval-expression e)
-  (define c
-    (compile (expand-expression e)))
+  (define exp (expand-expression e))
+  (printf "~v\n\n" exp)
+  (define c (compile exp))
   (values c
           (eval c)))
 
@@ -16,7 +17,7 @@
   (define-values (c v) (compile+eval-expression e))
   (when check-val
     (unless (equal? v check-val)
-      (error "check failed")))
+      (error "check failed" v)))
   v)
 
 (compile+eval-expression
@@ -27,6 +28,10 @@
 
 (compile+eval-expression
  '(lambda (x) (define-values (y) x) y))
+
+#;
+(compile+eval-expression
+ '(lambda (x) y (define-values (y) x)))
 
 (compile+eval-expression
  '(lambda (x)
@@ -97,6 +102,10 @@
                              refs)))))])
    ()
    (gen (1 2) () ())))
+; (gen (2) ((x 1)) (x))
+; (gen () ((x 2) (x 1)) (x x))
+; (bind ((x 2) (x 1)) (x x))
+; (let-values ((x 2) (x 1)) (list x x))
 
 "use-site scopes (so not ambiguous)"
 (eval-expression
