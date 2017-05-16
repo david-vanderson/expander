@@ -1,5 +1,6 @@
 #lang racket/base
-(require "syntax.rkt")
+(require "syntax.rkt"
+         "expand-context.rkt")
 
 (provide resolve
          bound-identifier=?
@@ -136,24 +137,31 @@
   (set-tip-branch! t (branch-prev (tip-branch t))))
 
 ;; copy all the tips so this syntax won't be bound be future bindings
-(define (freeze s [record-tips #f])
+(define (freeze s [ctx #f])
+  (define (freeze* v) (freeze v ctx))
   (cond
     [(syntax? s)
      (struct-copy syntax s
-                  [e (freeze (syntax-e s))]
+                  [e (freeze* (syntax-e s))]
                   [tips (map (lambda (t)
-                               (if record-tips
+                               (define tips (and ctx
+                                                 (hash-ref (expand-context-defctx-tips ctx)
+                                                           (tip-phase t) #f)))
+                               (if tips
                                    (let ()
                                      ;; definition context, point it to the previous tip
                                      (define newt
                                        (struct-copy tip t [id 'frozen] [branch t]))
-                                     (set-box! record-tips (cons newt (unbox record-tips)))
+                                     ;(printf "freeze adding tip at ~v\n" (tip-branch t))
+                                     (hash-set! (expand-context-defctx-tips ctx)
+                                                (tip-phase t)
+                                                (cons newt tips))
                                      newt)
                                    (struct-copy tip t [id 'frozen])))
                              (syntax-tips s))])]
-    [(list? s) (map freeze s)]
-    [(pair? s) (cons (freeze (car s))
-                     (freeze (cdr s)))]
+    [(list? s) (map freeze* s)]
+    [(pair? s) (cons (freeze* (car s))
+                     (freeze* (cdr s)))]
     [else s]))
 
 
@@ -174,40 +182,36 @@
 ;; thaw all macro-introduced syntax (mark is #f), leave other syntax alone
 ;; all introduced syntax that was on the same tip when frozen will end
 ;; up on the same new tip
-(define (thaw-introduced s phase [record-tips #f])
+(define (thaw-introduced s ctx)
   (define newtips (make-hasheq))
   (let thaw-introduced* ((s s))
     (cond
       [(and (syntax? s) (not (syntax-mark s)))
        ; introduced syntax, make a new branch
-       (define t (syntax-tip s phase))
-       (cond
-         [(not t)
-          (when (identifier? s)
-            (error "can't find a tip with phase for identifier:" phase s))
-          ; a lot of macros do (datum->syntax #f (list ...))
-          ; where they don't care about the binding environment of the parenthesis
-          ; so we will ignore that special case
-          (struct-copy syntax s
-                       [e (thaw-introduced* (syntax-e s))]
-                       [mark #f])]
-         [else
-          (unless (equal? 'frozen (tip-id t))
-            (error "trying to thaw unfrozen tip" s))
-          (define nt (hash-ref newtips (tip-branch t) 'notfound))
-          (when (equal? 'notfound nt)
-            (set! nt (tip (gensym 'tip) phase (tip-branch t)))
-            ; map old branch to new tip
-            (hash-set! newtips (tip-branch t) nt)
-            (when record-tips
-              (set-box! record-tips (cons nt (unbox record-tips)))))
+       (struct-copy syntax s
+                    [e (thaw-introduced* (syntax-e s))]
+                    [mark #f]
+                    [tips
+                     (map
+                      (lambda (t)
+                        (unless (equal? 'frozen (tip-id t))
+                          (error "trying to thaw unfrozen tip" s))
+                        (define nt (hash-ref newtips (tip-branch t) 'notfound))
+                        (when (equal? 'notfound nt)
+                          (set! nt (struct-copy tip t [id (gensym 'tip)]))
+                          (tip-extend! nt (gensym 'fake) 'var 'fake)
+                          ; map old branch to new tip
+                          (hash-set! newtips (tip-branch t) nt)
+                          (define tips (hash-ref (expand-context-defctx-tips ctx) (tip-phase t) #f))
+                          (when tips
+                            ;(printf "thaw adding defctx tip ~a\n" (tip-id nt))
+                            (hash-set! (expand-context-defctx-tips ctx) (tip-phase t)
+                                       (cons nt tips))))
           
-          (when (identifier? s)
-            (printf "thaw adding ~a to ~a\n" (tip-id nt) (syntax-e s)))
-          (struct-copy syntax s
-                       [e (thaw-introduced* (syntax-e s))]
-                       [mark #f]
-                       [tips (cons nt (remove t (syntax-tips s)))])])]
+                        ;(when (identifier? s)
+                        ;  (printf "thaw adding ~a to ~a at phase ~a\n" (tip-id nt) (syntax-e s) (tip-phase nt)))
+                        nt)
+                      (syntax-tips s))])]
       [(and (syntax? s) (syntax-mark s))
        ; not introduced, just reset mark
        (struct-copy syntax s

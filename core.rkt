@@ -23,6 +23,7 @@
 (tip-extend! coret 'null? 'prim null?)
 (tip-extend! coret 'map 'prim map)
 (tip-extend! coret 'values 'prim values)
+(tip-extend! coret 'bound-identifier=? 'prim bound-identifier=?)
 
 
 ;; define-values and define-syntaxes are only recognized inside
@@ -238,7 +239,9 @@
     (define old-tips (list))
     ;; Evaluate compile-time expressions:
     (define trans-vals (for/list ([rhs (in-list (m 'trans-rhs))])
-                         (eval-for-syntaxes-binding rhs (m 'trans-id) ctx)))
+                         ; car because this returns a list of the values produced,
+                         ; and let-syntax only supports a single value
+                         (car (eval-for-syntaxes-binding rhs (m 'trans-id) ctx))))
 
     ;; Bind each left-hand identifier
     (define trans-keys
@@ -299,8 +302,12 @@
   (lambda (s ctx)
     (define m (match-syntax s '(quote-syntax datum)))
     ;; core form of 'quote-syntax expands to literal 'quote-syntax
-    (freeze (rebuild s (list (literal 'quote-syntax ctx) (m 'datum)))
-            (expand-context-record-tips ctx))))
+    (freeze (rebuild s (list (literal 'quote-syntax ctx)
+                             (m 'datum)))
+            ; this is the only freeze where we pass the ctx so
+            ; that if we are in a definition context in some phase
+            ; those tips won't be fully frozen
+            ctx)))
 
 
 (tip-extend! coret 'if 'form

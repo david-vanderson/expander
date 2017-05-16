@@ -8,7 +8,7 @@
 
 (define (compile+eval-expression e)
   (define exp (expand-expression e))
-  (printf "~v\n\n" exp)
+  ;(printf "~v\n\n" exp)
   (define c (compile exp))
   (values c
           (eval c)))
@@ -147,3 +147,41 @@
                        ()
                        v))
   (error "shouldn't get here"))
+
+
+"bound-identifier=?"
+(eval-expression
+ #:check 2
+ '(let-values (((x) 5))
+   (define-syntaxes (m)
+     (lambda (stx)
+       (if (bound-identifier=? (quote-syntax x) (car (cdr (syntax-e stx))) 0)
+           (quote-syntax 1)
+           (quote-syntax 2))))
+    (m x)))
+
+"nested quote-syntax"
+(eval-expression
+ #:check 5
+ '(let-values (((x) 5))
+    (let-syntax ((m
+                  (lambda (stx)
+                    (let-syntax ((m2
+                                  (lambda (stx)
+                                    (quote-syntax (quote-syntax x)))))
+                      (datum->syntax
+                       (quote-syntax here)
+                       (list 'let-values '(((x) 6))
+                             (m2)))))))
+      (m))))
+
+"nested definition contexts"
+(eval-expression
+ #:check 5
+ '(let-values ()
+   (define-syntaxes (m-x)
+     (lambda (stx)
+       (let-values ()
+         (quote-syntax x))))
+   (define-values (x) 5)
+   (m-x)))
