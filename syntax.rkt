@@ -4,7 +4,7 @@
  (struct-out syntax) ; includes `syntax?` and `syntax-e`
  identifier?
 
- empty-tips
+ empty-branches
  
  syntax->datum
  datum->syntax
@@ -12,18 +12,19 @@
  syntax-property)
 
 (struct syntax (e      ; datum and nested syntax objects
-                mark   ; #t or #f to distinguish introduced syntax
-                tips   ; list of tips, one for each phase
+                marks  ; stack of unique ids used to distinguish macro-introduced syntax
+                branches  ; hash of branch heads, one for each phase
                 srcloc ; source location
                 props) ; properties
         ;; Custom printer:
-        #:property prop:custom-write
-        (lambda (s port mode)
-          (write-string "#<syntax:" port)
-          (fprintf port "~.s" (syntax->datum s))
-          (write-string ">" port)))
+;        #:property prop:custom-write
+;        (lambda (s port mode)
+;          (write-string "#<syntax:" port)
+;          (fprintf port "~.s" (syntax->datum s))
+;          (write-string ">" port))
+  #:transparent)
 
-(define empty-tips (list))
+(define empty-branches #hash())
 (define empty-props #hash())
 
 (define (identifier? s)
@@ -39,10 +40,13 @@
 
 (define (datum->syntax stx-c v [stx-l #f] [stx-p #f])
   (define (wrap e)
-    (syntax e #f
+    (syntax e
             (if stx-c
-                (syntax-tips stx-c)
-                empty-tips)
+                (syntax-marks stx-c)
+                null)
+            (if stx-c
+                (syntax-branches stx-c)
+                empty-branches)
             (and stx-l (syntax-srcloc stx-l))
             (if stx-p (syntax-props stx-p) empty-props)))
   (cond

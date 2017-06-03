@@ -21,6 +21,15 @@
   v)
 
 (compile+eval-expression
+ '(quote 5))
+
+(eval-expression
+ #:check '(x1)
+ '(let-values ([(x) 'x1]
+               [(y) 'y1])
+    (list x)))
+
+(compile+eval-expression
  '(case-lambda
    [(x) (set! x 5)]
    [(x y) (begin0 y x)]

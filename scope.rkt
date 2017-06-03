@@ -7,88 +7,132 @@
          free-identifier=?
          introduce
 
-         (struct-out tip)
          (struct-out bind)
-         syntax-tip
-         tip-extend!
-         tip-pop!
-         freeze
+         (struct-out branch)
+         get-branch
+         extend-branch
+         add-binding!
          mark
-         thaw-introduced
-         snip-tips!)
+         branch-introduced)
 
 ;; Each syntax object has as pointer (for each phase) to the
 ;; binding branch tip that represents bindings that affect it.
 
-;; As we expand, we add/remove bindings imperitively to the tip
-;; so un-expanded syntax using that tip sees the new bindings.
+;; As we expand a binding context, we add a branch to the end of
+;; every syntax's branch head in that context and phase.  Then for
+;; each identifier being bound, we see if that identifier binds
+;; each syntax, and if so, we add a bind to that syntax's branch.
 
-;; As each syntax is expanded, we freeze its tips so it will
-;; remember the exact bindings in effect as it was expanded.
+;; For each macro invocation, we take introduced syntax and branch
+;; it to a new tip with an extra placeholder binding.  This creates
+;; the extra dimension of binding that hygiene requires.
 
-;; For each macro invocation, we take introduced syntax and thaw
-;; it to a new tip.  This creates the extra dimension of binding
-;; that hygiene requires.
+;; A branch represents a list of bindings and points to the
+;; previous branch that this branch extends
 
-
-;; A branch represents a single binding and points to the
-;; previous branch that this binding extends
+;; branch is mutable for definition contexts
+(struct branch (id       ; unique id for this binding context
+                [binds #:mutable]  ; list of binds
+                prev)    ; #f or branch that this branch extends
+  #;#:transparent)
 
 ;; type 'var  -> val is gensym for local variable
 ;; type 'form -> val is core form
 ;; type 'prim -> val is core primitive
 ;; type 'stx  -> val is procedure? for macro, else syntax error
-;; bind is mutable so in letrec-syntaxes we can bind all the ids
+;; val is mutable so in letrec-syntaxes we can bind all the ids
 ;; first and then patch the vals in later
-(struct bind (type val)
-  #:transparent #:mutable)
-
-;; branch is mutable for definition contexts, where it can point to
-;; tips that we later need to snip out
-(struct branch (id       ; symbol
-                binding  ; bind struct
-                prev)    ; #f or branch that this branch extends (or tip in definition context)
-  #:transparent #:mutable)
+(struct bind (id    ; symbol
+              type  ; see above
+              [val #:mutable])
+  #;#:transparent)
 
 
-;; A tip holds a branch and is mutable so the branch can be
-;; extended at the front
-;; it is unique to a given phase
-(struct tip (id       ; unique id or 'frozen
-             phase    ; integer
-             branch)  ; pointer to first branch or another tip in a definition context
-  #:transparent #:mutable)
+(define (syntax-map s f)
+  (let loop ((s s))
+    (cond
+      [(syntax? s)
+       (f (struct-copy syntax s [e (loop (syntax-e s))]))]
+      [(list? s) (map loop s)]
+      [(pair? s) (cons (loop (car s))
+                       (loop (cdr s)))]
+      [else s])))
 
 
-(define (syntax-tip s phase (err? #f))
-  (define t (findf (lambda (t) (= phase (tip-phase t))) (syntax-tips s)))
-  (when (and err? (not t))
-    (error "can't find a tip with phase:" phase s))
-  t)
+(define (introduce s phase branch-head)
+  (syntax-map s
+    (lambda (s)
+      (when (hash-has-key? (syntax-branches s) phase)
+        (error "already have a branch head for this phase" phase s))
+      (struct-copy syntax s
+                   [branches (hash-set (syntax-branches s) phase branch-head)]))))
 
+(define (extend-branch s id phase)
+  (syntax-map s
+    (lambda (s)
+      (define bh (hash-ref (syntax-branches s) phase #f))
+      ;(when (identifier? s)
+      ;  (printf "~a adding ~a branch ~a\n" phase (syntax-e s) id))
+      (struct-copy syntax s
+                   [branches (hash-set (syntax-branches s) phase
+                                       (branch id '() bh))]))))
 
-(define (introduce s phase tip)
-  (define (nsi s) (introduce s phase tip))
+(define (get-branch s id phase)
+  (let loop ((b (hash-ref (syntax-branches s) phase 'missing)))
+    (cond
+      [(equal? b 'missing)
+       ; this syntax doesn't have a branch in this phase (literals, parenthesis)
+       #f]
+      [(not b)  ; hit the end
+       #f]
+      [(equal? id (branch-id b))
+       b]  ; found it
+      [else
+       (loop (branch-prev b))])))
+
+(define (branches-equal? a b)
   (cond
-    [(syntax? s)
-     (when (syntax-tip s phase)
-       (error "already have a tip for this phase" phase s))
-     (struct-copy syntax s
-                  [e (nsi (syntax-e s))]
-                  [tips (cons tip (syntax-tips s))])]
-    [(list? s) (map nsi s)]
-    [(pair? s) (cons (nsi (car s))
-                     (nsi (cdr s)))]
-    [else s]))
+    [(and (not a) (not b))
+     #t]
+    [(and a b (equal? (branch-id a) (branch-id b)))
+     (branches-equal? (branch-prev a) (branch-prev b))]
+    [else
+     #f]))
+      
+
+;; For all syntax s, if it has a branch with branchid-prefix somewhere,
+;; then we are binding it, which means add bind to the list of binds
+;; in the branch branchid-to-bind
+(define (add-binding! s phase branch-prefix branchid-to-bind bind)
+  (let loop ((s s))
+    ;(printf "  add-binding ~v\n" s)
+    (cond
+      [(syntax? s)
+       (define b (get-branch s (branch-id branch-prefix) phase))
+       (when (branches-equal? branch-prefix b)
+         ;(when (identifier? s)
+         ;  (printf "~a add-binding! ~a bind ~a prefix ~a in ~a\n"
+         ;          phase (syntax-e s) (bind-id bind) (branch-id branch-prefix) branchid-to-bind))
+         
+         (define b (get-branch s branchid-to-bind phase))
+         (set-branch-binds! b (cons bind (branch-binds b))))
+       (loop (syntax-e s))]
+      [(list? s) (map loop s)]
+      [(pair? s) (cons (loop (car s))
+                       (loop (cdr s)))]
+      [else s])))
 
 
+;; I'm not sure bound-identifier=? can always be reflective
+;; This implementation will work for syntax that hasn't been expanded before
+;; but for already-expanded syntax we need something else
 (define (bound-identifier=? a b phase)
   ; do these live on the same tip, so that binding one will affect the other?
   (and (eq? (syntax-e a) (syntax-e b))
-       (let ((ta (syntax-tip a phase))
-             (tb (syntax-tip b phase)))
-         (and ta tb  ; must have tips
-              (eq? ta tb)))))
+       (let ((ba (hash-ref (syntax-branches a) phase #f))
+             (bb (hash-ref (syntax-branches b) phase #f)))
+         (and ba bb  ; must have branches
+              (eq? ba bb)))))
 
 
 (define (free-identifier=? a b phase)
@@ -98,126 +142,43 @@
 
 
 (define (resolve id phase (err? #f))
-  (let loop ((b (tip-branch (syntax-tip id phase #t))))
+  (let loop ((b (hash-ref (syntax-branches id) phase)))
     (cond
-      ((not b)  ; ran out of branches
+      [(not b)  ; ran out of branches
        (if err?
            (error "unbound identifier in phase:" phase id)
-           #f))
-      ((tip? b)
-       ;; only in definition contexts
-       (loop (tip-branch b)))
-      ((equal? (syntax-e id) (branch-id b))  ; found it
-       (branch-binding b))
-      (else
-       (loop (branch-prev b))))))
-
-
-(define (snip-tips! tip)
-  (when (tip? (tip-branch tip))
-    (set-tip-branch! tip (tip-branch (tip-branch tip)))
-    (snip-tips! tip))
-  (let loop ((b (tip-branch tip)))
-    (cond
-      [(not b)  ; done
-       (void)]
-      [(tip? (branch-prev b))
-       ;; only in definition contexts
-       (set-branch-prev! b (tip-branch (branch-prev b)))]
+           #f)]
       [else
-       (loop (branch-prev b))])))
-
-
-;; add to this tip's branch
-(define (tip-extend! t id bind-type bind-val)
-  (set-tip-branch! t (branch id (bind bind-type bind-val) (tip-branch t))))
-
-;; remove most recent binding
-(define (tip-pop! t)
-  (set-tip-branch! t (branch-prev (tip-branch t))))
-
-;; copy all the tips so this syntax won't be bound be future bindings
-(define (freeze s [ctx #f])
-  (define (freeze* v) (freeze v ctx))
-  (cond
-    [(syntax? s)
-     (struct-copy syntax s
-                  [e (freeze* (syntax-e s))]
-                  [tips (map (lambda (t)
-                               (define tips (and ctx
-                                                 (hash-ref (expand-context-defctx-tips ctx)
-                                                           (tip-phase t) #f)))
-                               (if tips
-                                   (let ()
-                                     ;; definition context, point it to the previous tip
-                                     (define newt
-                                       (struct-copy tip t [id 'frozen] [branch t]))
-                                     ;(printf "freeze adding tip at ~v\n" (tip-branch t))
-                                     (hash-set! (expand-context-defctx-tips ctx)
-                                                (tip-phase t)
-                                                (cons newt tips))
-                                     newt)
-                                   (struct-copy tip t [id 'frozen])))
-                             (syntax-tips s))])]
-    [(list? s) (map freeze* s)]
-    [(pair? s) (cons (freeze* (car s))
-                     (freeze* (cdr s)))]
-    [else s]))
-
+       (define bind (findf (lambda (idbind) (equal? (syntax-e id) (bind-id idbind)))
+                           (branch-binds b)))
+       (if bind
+           bind
+           (loop (branch-prev b)))])))
 
 ;; ------------------------------------------
 
-;; set a mark on all syntax going into a macro
-(define (mark s)
-  (cond
-    [(syntax? s)
-     (struct-copy syntax s
-                  [e (mark (syntax-e s))]
-                  [mark #t])]
-    [(list? s) (map mark s)]
-    [(pair? s) (cons (mark (car s))
-                     (mark (cdr s)))]
-    [else s]))
+;; set a mark m on all syntax going into a macro
+(define (mark s m)
+  (syntax-map s
+    (lambda (s)
+      (struct-copy syntax s
+                   [marks (cons m (syntax-marks s))]))))
 
-;; thaw all macro-introduced syntax (mark is #f), leave other syntax alone
-;; all introduced syntax that was on the same tip when frozen will end
-;; up on the same new tip
-(define (thaw-introduced s ctx)
-  (define newtips (make-hasheq))
-  (let thaw-introduced* ((s s))
-    (cond
-      [(and (syntax? s) (not (syntax-mark s)))
-       ; introduced syntax, make a new branch
-       (struct-copy syntax s
-                    [e (thaw-introduced* (syntax-e s))]
-                    [mark #f]
-                    [tips
-                     (map
-                      (lambda (t)
-                        (unless (equal? 'frozen (tip-id t))
-                          (error "trying to thaw unfrozen tip" s))
-                        (define nt (hash-ref newtips (tip-branch t) 'notfound))
-                        (when (equal? 'notfound nt)
-                          (set! nt (struct-copy tip t [id (gensym 'tip)]))
-                          (tip-extend! nt (gensym 'fake) 'var 'fake)
-                          ; map old branch to new tip
-                          (hash-set! newtips (tip-branch t) nt)
-                          (define tips (hash-ref (expand-context-defctx-tips ctx) (tip-phase t) #f))
-                          (when tips
-                            ;(printf "thaw adding defctx tip ~a\n" (tip-id nt))
-                            (hash-set! (expand-context-defctx-tips ctx) (tip-phase t)
-                                       (cons nt tips))))
-          
-                        ;(when (identifier? s)
-                        ;  (printf "thaw adding ~a to ~a at phase ~a\n" (tip-id nt) (syntax-e s) (tip-phase nt)))
-                        nt)
-                      (syntax-tips s))])]
-      [(and (syntax? s) (syntax-mark s))
-       ; not introduced, just reset mark
-       (struct-copy syntax s
-                    [e (thaw-introduced* (syntax-e s))]
-                    [mark #f])]
-      [(list? s) (map thaw-introduced* s)]
-      [(pair? s) (cons (thaw-introduced* (car s))
-                       (thaw-introduced* (cdr s)))]
-      [else s])))
+;; branch all macro-introduced syntax (top mark is not m)
+(define (branch-introduced s m branchid)
+  (syntax-map s
+    (lambda (s)
+      (define intro? (or (null? (syntax-marks s))
+                         (not (equal? m (car (syntax-marks s))))))
+      (struct-copy syntax s
+                   [marks (if intro?
+                              (syntax-marks s)
+                              (cdr (syntax-marks s)))]
+                   [branches
+                    (cond
+                      [(not intro?) (syntax-branches s)]
+                      [else
+                       (for/hash ([(p b) (in-hash (syntax-branches s))])
+                         ;(when (identifier? s)
+                         ;  (printf "~a branch ~a from ~a to ~a\n" p (syntax-e s) (branch-id b) branchid))
+                         (values p (branch branchid '() b)))])]))))

@@ -8,10 +8,10 @@
          
          current-namespace)
 
-(struct namespace (tips))
+(struct namespace ())
 
 (define (make-empty-namespace)
-  (namespace empty-tips))
+  (namespace))
 
 (define current-namespace (make-parameter (make-empty-namespace)))
 

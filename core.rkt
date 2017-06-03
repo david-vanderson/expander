@@ -1,4 +1,4 @@
-#lang racket/base
+#lang racket
 (require "syntax.rkt"
          "scope.rkt"
          "match.rkt"
@@ -6,35 +6,39 @@
          "expand-context.rkt"
          "compile.rkt")
 
-(provide coret)
+(provide coreb)
 
 
-(define coret (tip 'coret #f #f))
+(define coreb (branch 'core '() #f))
 
+(define-syntax (append-core! stx)
+  (syntax-case stx ()
+    ((_ bind)
+     #'(set-branch-binds! coreb (cons bind (branch-binds coreb))))))
 
 ;; Register core primitives
 ;; Enough primitives for examples...
-(tip-extend! coret 'syntax-e 'prim syntax-e)
-(tip-extend! coret 'datum->syntax 'prim datum->syntax)
-(tip-extend! coret 'cons 'prim cons)
-(tip-extend! coret 'list 'prim list)
-(tip-extend! coret 'car 'prim car)
-(tip-extend! coret 'cdr 'prim cdr)
-(tip-extend! coret 'null? 'prim null?)
-(tip-extend! coret 'map 'prim map)
-(tip-extend! coret 'values 'prim values)
-(tip-extend! coret 'bound-identifier=? 'prim bound-identifier=?)
+(append-core! (bind 'syntax-e 'prim syntax-e))
+(append-core! (bind 'datum->syntax 'prim datum->syntax))
+(append-core! (bind 'cons 'prim cons))
+(append-core! (bind 'list 'prim list))
+(append-core! (bind 'car 'prim car))
+(append-core! (bind 'cdr 'prim cdr))
+(append-core! (bind 'null? 'prim null?))
+(append-core! (bind 'map 'prim map))
+(append-core! (bind 'values 'prim values))
+(append-core! (bind 'bound-identifier=? 'prim bound-identifier=?))
 
 
 ;; define-values and define-syntaxes are only recognized inside
 ;; a definition context, and are handled there
-(tip-extend! coret 'define-values 'form
+(append-core! (bind 'define-values 'form
   (lambda (s ctx)
-    (error "define-values not allowed in an expression position:" s)))
+    (error "define-values not allowed in an expression position:" s))))
 
-(tip-extend! coret 'define-syntaxes 'form
+(append-core! (bind 'define-syntaxes 'form
   (lambda (s ctx)
-    (error "define-syntaxes not allowed in an expression position:" s)))
+    (error "define-syntaxes not allowed in an expression position:" s))))
 
 
 (define (check-no-duplicate-ids id-list phase)
@@ -73,59 +77,58 @@
 
 ;; Common expansion for `lambda` and `case-lambda`
 (define (make-lambda-expander s formals bodys ctx)
+  ;(printf "lambda-expander expanding ~v\n~v\n\n" (syntax->datum formals) (map syntax->datum bodys))
   ;; Parse and check formal arguments:
   (define ids (parse-and-flatten-formals formals))
   (check-no-duplicate-ids ids (expand-context-phase ctx))
-  (define old-tips (list))
-  (define exp-ids
+
+  (define prefixes
     (for/list ([id (in-list ids)])
-      ;; Get the tip from the binding variable
-      (define t (syntax-tip id (expand-context-phase ctx) #t))
-      (define sym (syntax-e id))
-      ;; Add the new binding
-      (tip-extend! t sym 'var (gensym sym))
-      ;; save this old tip before we freeze so we can pop it later
-      (set! old-tips (cons t old-tips))
-      ;; Freeze binding branch on id
-      (freeze id)))
+      (hash-ref (syntax-branches id) (expand-context-phase ctx))))
+  
+  (define bid (gensym 'lambda))
+  (set! ids (extend-branch ids bid (expand-context-phase ctx)))
+  (set! bodys (extend-branch bodys bid (expand-context-phase ctx)))
+  (for ([id (in-list ids)]
+        [prefix (in-list prefixes)])
+    (define sym (syntax-e id))
+    (define b (bind sym 'var (gensym sym)))
+    ;; Add the new binding
+    (add-binding! ids (expand-context-phase ctx) prefix bid b)
+    (add-binding! bodys (expand-context-phase ctx) prefix bid b))
+
   ;; Expand the function body:
   ;(define exp-body (expand (car bodys) ctx))
   (define exp-body (expand-body s bodys ctx))
-  ;; Remove the new bindings
-  (for ([t (in-list old-tips)])
-    (tip-pop! t))
-
-  (values exp-ids exp-body))
+  
+  (values ids exp-body))
 
 
-(tip-extend! coret 'lambda 'form
+(append-core! (bind 'lambda 'form
  (lambda (s ctx)
-   (define m (match-syntax s '(lambda-id formals body ...+)))
+   (define m (match-syntax s '(lambda formals body ...+)))
    (define-values (formals body)
      (make-lambda-expander s (m 'formals) (m 'body) ctx))
    
-   ;; the core form always results in a literal 'lambda
-   (freeze (rebuild s (list (literal 'lambda ctx) formals body)))))
+   (rebuild s (list (m 'lambda) formals body)))))
 
 
-(tip-extend! coret 'case-lambda 'form
+(append-core! (bind 'case-lambda 'form
  (lambda (s ctx)
    (define m (match-syntax s '(case-lambda [formals body ...+] ...)))
    (define cm (match-syntax s '(case-lambda clause ...)))
-
-   ;; the core form always results in a literal 'case-lambda
-   (freeze (rebuild s
-             `(,(literal 'case-lambda ctx)
-               ,@(for/list ([formals (in-list (m 'formals))]
-                            [bodys (in-list (m 'body))]
-                            [clause (in-list (cm 'clause))])
-                   (define-values (exp-formals exp-body)
-                     (make-lambda-expander s formals bodys ctx))
-                   (rebuild clause `[,exp-formals ,exp-body])))))))
+   (rebuild s
+            `(,(m 'case-lambda)
+              ,@(for/list ([formals (in-list (m 'formals))]
+                           [bodys (in-list (m 'body))]
+                           [clause (in-list (cm 'clause))])
+                  (define-values (exp-formals exp-body)
+                    (make-lambda-expander s formals bodys ctx))
+                  (rebuild clause `[,exp-formals ,exp-body])))))))
 
 
 ;; Common expansion for `let[rec]-[syntaxes+]values`
-(define (make-let-values-form syntaxes? rec?)
+(define (make-let-values-form letsym syntaxes? rec?)
   (lambda (s ctx)
     (define m (if syntaxes?
                   (match-syntax s '(let-syntax-id
@@ -135,212 +138,221 @@
                   (match-syntax s '(let-id ([(val-id ...) val-rhs] ...)
                                     body ...+))))
     
-    (define old-tips null)
-    (define maybe-transids #f)  ; possible list of bound trans-ids
-    (define maybe-transs #f)  ; possible list of transformers
-    (define exp-rhs #f)
+    (define transids (if syntaxes? (m 'trans-id) null))
+    (define transs (if syntaxes? (m 'trans-rhs) null))
+    (define valids (m 'val-id))
+    (define valrhs (m 'val-rhs))
+    (define bodys (m 'body))
+
+    ;(printf "make-let-values body is ~v\n\n" (map syntax->datum bodys))
 
     (when (not rec?)
       ;; expand+eval trans-rhs before binding
-      (when syntaxes?
-        (set! maybe-transs
-              (for/list ([ids (in-list (m 'trans-id))]
-                         [rhs (in-list (m 'trans-rhs))])
-                (eval-for-syntaxes-binding rhs ids ctx))))
+      (set! transs
+            (for/list ([ids (in-list transids)]
+                       [rhs (in-list transs)])
+              (eval-for-syntaxes-binding rhs ids ctx)))
 
       ; expand val-rhs before binding
-      (set! exp-rhs
-            (for/list ([rhs (in-list (m 'val-rhs))])
+      (set! valrhs
+            (for/list ([rhs (in-list valrhs)])
               (expand rhs ctx))))
 
     ;; do the binding part
-    (when syntaxes?
-      (set! maybe-transids
-            (for/list ([ids (in-list (m 'trans-id))]
-                       [transs (in-list (if rec?
-                                            (m 'trans-id)  ; unused, but the right length
-                                            maybe-transs))])
-              (for/list ([id (in-list ids)]
-                         [trans (in-list transs)])
-                ;; Get the tip from the binding variable
-                (define t (syntax-tip id (expand-context-phase ctx) #t))
-                (define sym (syntax-e id))
-                ;; Add the new binding
-                (tip-extend! t sym 'stx (if rec? #f trans))
-                ;; save this old tip before we freeze so we can pop it later
-                (set! old-tips (cons t old-tips))
-                ;; Freeze binding branch on id
-                (freeze id)))))
-
-    (define exp-val-ids
-      (for/list ([ids (in-list (m 'val-id))])
+    ; get prefixes before we extend the branches
+    (define trans-prefixes
+      (for/list ([ids (in-list transids)])
         (for/list ([id (in-list ids)])
-          ;; Get the tip from the binding variable
-          (define t (syntax-tip id (expand-context-phase ctx) #t))
-          (define sym (syntax-e id))
-          ;; Add the new binding
-          (tip-extend! t sym 'var (gensym sym))
-          ;; save this old tip before we freeze so we can pop it later
-          (set! old-tips (cons t old-tips))
-          ;; Freeze binding branch on id
-          (freeze id))))
+          (hash-ref (syntax-branches id) (expand-context-phase ctx)))))
+    
+    (define val-prefixes
+      (for/list ([ids (in-list valids)])
+        (for/list ([id (in-list ids)])
+          (hash-ref (syntax-branches id) (expand-context-phase ctx)))))
+    ;(printf "val-prefixes ~v\n" val-prefixes)
+
+    (define bid (gensym letsym))
+    (set! transids (extend-branch transids bid (expand-context-phase ctx)))
+    (when rec? (set! transs (extend-branch transs bid (expand-context-phase ctx))))
+    (set! valids (extend-branch valids bid (expand-context-phase ctx)))
+    (when rec? (set! valrhs (extend-branch valrhs bid (expand-context-phase ctx))))
+    (set! bodys (extend-branch bodys bid (expand-context-phase ctx)))
+    
+    (for ([ids (in-list transids)]
+          [pids (in-list trans-prefixes)]
+          [trans (in-list (if rec? transids transs))])
+      (for ([id (in-list ids)]
+            [pid (in-list pids)]
+            [t (in-list trans)])
+        (define sym (syntax-e id))
+        (define b (bind sym 'stx (if rec? #f t)))
+        ;; Add the new binding
+        (add-binding! transids (expand-context-phase ctx) pid bid b)
+        (when rec? (add-binding! transs (expand-context-phase ctx) pid bid b))
+        (add-binding! valids (expand-context-phase ctx) pid bid b)
+        (when rec? (add-binding! valrhs (expand-context-phase ctx) pid bid b))
+        (add-binding! bodys (expand-context-phase ctx) pid bid b)))
+
+    (for ([ids (in-list valids)]
+          [pids (in-list val-prefixes)])
+      (for ([id (in-list ids)]
+            [pid (in-list pids)])
+        (define sym (syntax-e id))
+        (define b (bind sym 'var (gensym sym)))
+        ;; Add the new binding
+        (add-binding! transids (expand-context-phase ctx) pid bid b)
+        (when rec? (add-binding! transs (expand-context-phase ctx) pid bid b))
+        (add-binding! valids (expand-context-phase ctx) pid bid b)
+        (when rec? (add-binding! valrhs (expand-context-phase ctx) pid bid b))
+        ;(printf "add-binding! to ~v\n" (map syntax->datum bodys))
+        (add-binding! bodys (expand-context-phase ctx) pid bid b)))
 
     (when rec?
       ;; expand+eval trans-rhs after binding
-      (when syntaxes?
-        ;; go back through each trans-id, find the binding,
-        ;; and replace its dummy val with the transformer
-        (for ([ids (in-list maybe-transids)]
-              [rhs (in-list (m 'trans-rhs))])
-          (define transformers
-            (eval-for-syntaxes-binding rhs ids ctx))
-          
-          (for ([id (in-list ids)]
-                [trans (in-list transformers)])
-            (define binding (resolve id (expand-context-phase ctx) #t))
-            (set-bind-val! binding trans))))
+      ;; go back through each trans-id, find the binding,
+      ;; and replace its dummy val with the transformer
+      (for ([ids (in-list transids)]
+            [rhs (in-list transs)])
+        (define transformers
+          (eval-for-syntaxes-binding rhs ids ctx))
+        
+        (for ([id (in-list ids)]
+              [trans (in-list transformers)])
+          (define binding (resolve id (expand-context-phase ctx) #t))
+          (set-bind-val! binding trans)))
 
       ; expand val-rhs in presence of bindings
-      (set! exp-rhs
-            (for/list ([rhs (in-list (m 'val-rhs))])
+      (set! valrhs
+            (for/list ([rhs (in-list valrhs)])
               (expand rhs ctx))))
 
     ;; expand body
-    ;(define exp-body (expand (car (m 'body)) ctx))
-    (define exp-body (expand-body s (m 'body) ctx))
-    
-    ;; Remove the new bindings
-    (for ([t (in-list old-tips)])
-      (tip-pop! t))
+    ;(define exp-body (expand (car bodys) ctx))
+    (define exp-body (expand-body s bodys ctx))
 
     ;; create the new syntax using let[rec]-values
-    (freeze (rebuild s
+    (rebuild s
              `(,(literal (if rec? 'letrec-values 'let-values) ctx)
-               ,(for/list ([ids (in-list exp-val-ids)]
-                           [rhs (in-list exp-rhs)])
+               ,(for/list ([ids (in-list valids)]
+                           [rhs (in-list valrhs)])
                   `[,ids ,rhs])
-               ,exp-body)))))
+               ,exp-body))))
 
-(tip-extend! coret 'let-values 'form
- (make-let-values-form #f #f))
+(append-core! (bind 'let-values 'form
+ (make-let-values-form 'let-values #f #f)))
 
-(tip-extend! coret 'letrec-values 'form
- (make-let-values-form #f #t))
+(append-core! (bind 'letrec-values 'form
+ (make-let-values-form 'letrec-values #f #t)))
 
-(tip-extend! coret 'letrec-syntaxes+values 'form
- (make-let-values-form #t #t))
+(append-core! (bind 'letrec-syntaxes+values 'form
+ (make-let-values-form 'letrec-syntaxes+values #t #t)))
 
 
-(tip-extend! coret 'let-syntax 'form
+(append-core! (bind 'let-syntax 'form
   (lambda (s ctx)
     (define m (match-syntax s '(let-syntax ([trans-id trans-rhs]
                                            ...)
                                  body)))
-    (define old-tips (list))
+    (define body (m 'body))
+    (define tids (m 'trans-id))
     ;; Evaluate compile-time expressions:
     (define trans-vals (for/list ([rhs (in-list (m 'trans-rhs))])
                          ; car because this returns a list of the values produced,
                          ; and let-syntax only supports a single value
-                         (car (eval-for-syntaxes-binding rhs (m 'trans-id) ctx))))
+                         (car (eval-for-syntaxes-binding rhs tids ctx))))
 
-    ;; Bind each left-hand identifier
-    (define trans-keys
-      (for/list ([id (in-list (m 'trans-id))]
-                 [trans (in-list trans-vals)])
-        (define t (syntax-tip id (expand-context-phase ctx) #t))
-        (define sym (syntax-e id))
-        ;; Add the new binding
-        (tip-extend! t sym 'stx trans)
-        ;; save this old tip before we freeze so we can pop it later
-        (set! old-tips (cons t old-tips))
-        ;; Freeze binding branch on id
-        (freeze id)))
-
-    ;(printf "expanding body\n")
+    (define prefixes
+      (for/list ([id (in-list tids)])
+        (hash-ref (syntax-branches id) (expand-context-phase ctx))))
+  
+    (define bid (gensym 'let-syntax))
+    (set! tids (extend-branch tids bid (expand-context-phase ctx)))
+    (set! body (extend-branch body bid (expand-context-phase ctx)))
+    (for ([id (in-list tids)]
+          [prefix (in-list prefixes)]
+          [t (in-list trans-vals)])
+      (define sym (syntax-e id))
+      (define b (bind sym 'stx t))
+      ;; Add the new binding
+      (add-binding! tids (expand-context-phase ctx) prefix bid b)
+      (add-binding! body (expand-context-phase ctx) prefix bid b))
+    
     ;; Expand body
-    (define exp-body (expand (m 'body) ctx))
-    ;; Remove the new bindings
-    (for ([t (in-list old-tips)])
-      (tip-pop! t))
+    (define exp-body (expand body ctx))
 
-    exp-body))
+    exp-body)))
 
 
-(tip-extend! coret '#%datum 'form
+(append-core! (bind '#%datum 'form
  (lambda (s ctx)
    (define m (match-syntax s '(#%datum . datum)))
    (when (keyword? (syntax-e (m 'datum)))
      (error "keyword misused as an expression:" (m 'datum)))
    ;; core form of #%datum expands to literal 'quote
-   (freeze (rebuild s (list (literal 'quote ctx)
-                            (m 'datum))))))
+   (rebuild s (list (literal 'quote ctx)
+                    (m 'datum))))))
 
-(tip-extend! coret '#%app 'form
+(append-core! (bind '#%app 'form
   (lambda (s ctx)
-    (define m (match-syntax s '(#%app-id rator rand ...)))
-    ;; core form of #%app leaves a literal '#%app
-    (freeze (rebuild s
-                     (list* (literal '#%app ctx)
-                            (expand (m 'rator) ctx)
-                            (for/list ([rand (in-list (m 'rand))])
-                              (expand rand ctx)))))))
+    (define m (match-syntax s '(#%app rator rand ...)))
+    (rebuild s
+             (list* (m '#%app)
+                    (expand (m 'rator) ctx)
+                    (for/list ([rand (in-list (m 'rand))])
+                      (expand rand ctx)))))))
 
-(tip-extend! coret '#%top 'form
+(append-core! (bind '#%top 'form
   (lambda (s ctx)
     (define m (match-syntax s '(#%top-id . datum)))
-    (error "unbound identifier in:" (m 'datum))))
+    (error "unbound identifier in:" (m 'datum)))))
 
 
-(tip-extend! coret 'quote 'form
+(append-core! (bind 'quote 'form
   (lambda (s ctx)
     (define m (match-syntax s '(quote datum)))
     ;; core form of 'quote expands to literal 'quote
-    (freeze (rebuild s (list (literal 'quote ctx) (m 'datum))))))
+    (rebuild s (list (m 'quote) (m 'datum))))))
 
 
-(tip-extend! coret 'quote-syntax 'form
+(append-core! (bind 'quote-syntax 'form
   (lambda (s ctx)
     (define m (match-syntax s '(quote-syntax datum)))
     ;; core form of 'quote-syntax expands to literal 'quote-syntax
-    (freeze (rebuild s (list (literal 'quote-syntax ctx)
-                             (m 'datum)))
-            ; this is the only freeze where we pass the ctx so
-            ; that if we are in a definition context in some phase
-            ; those tips won't be fully frozen
-            ctx)))
+    (rebuild s (list (m 'quote-syntax)
+                     (m 'datum))))))
 
 
-(tip-extend! coret 'if 'form
+(append-core! (bind 'if 'form
  (lambda (s ctx)
    (define m (match-syntax s '(if tst thn els)))
-   (freeze (rebuild s
-                    (list (m 'if)
-                          (expand (m 'tst) ctx)
-                          (expand (m 'thn) ctx)
-                          (expand (m 'els) ctx))))))
+   (rebuild s
+            (list (m 'if)
+                  (expand (m 'tst) ctx)
+                  (expand (m 'thn) ctx)
+                  (expand (m 'els) ctx))))))
 
-(tip-extend! coret 'with-continuation-mark 'form
+(append-core! (bind 'with-continuation-mark 'form
  (lambda (s ctx)
    (define m (match-syntax s '(with-continuation-mark key val body)))
-   (freeze (rebuild s
-                    (list (m 'with-continuation-mark)
-                          (expand (m 'key) ctx)
-                          (expand (m 'val) ctx)
-                          (expand (m 'body) ctx))))))
+   (rebuild s
+            (list (m 'with-continuation-mark)
+                  (expand (m 'key) ctx)
+                  (expand (m 'val) ctx)
+                  (expand (m 'body) ctx))))))
 
 
 (define (make-begin)
  (lambda (s ctx)
    (define m (match-syntax s '(begin-id e ...+)))
-   (freeze (rebuild s
-                    (cons (m 'begin-id)
-                          (for/list ([e (in-list (m 'e))])
-                            (expand e ctx)))))))
+   (rebuild s
+            (cons (m 'begin-id)
+                  (for/list ([e (in-list (m 'e))])
+                    (expand e ctx))))))
 
-(tip-extend! coret 'begin 'form (make-begin))
-(tip-extend! coret 'begin0 'form (make-begin))
+(append-core! (bind 'begin 'form (make-begin)))
+(append-core! (bind 'begin0 'form (make-begin)))
 
-(tip-extend! coret 'set! 'form
+(append-core! (bind 'set! 'form
  (lambda (s ctx)
    (define m (match-syntax s '(set! id rhs)))
    (define binding (resolve (m 'id) (expand-context-phase ctx)))
@@ -351,7 +363,7 @@
      (error "cannot assign to syntax:" s))
    (when (equal? 'prim (bind-type binding))
      (error "cannot assign to primitive:" s))
-   (freeze (rebuild s
-                    (list (literal 'set! ctx)
-                          (m 'id)
-                          (expand (m 'rhs) ctx))))))
+   (rebuild s
+            (list (literal 'set! ctx)
+                  (m 'id)
+                  (expand (m 'rhs) ctx))))))

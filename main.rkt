@@ -9,10 +9,10 @@
 
 
 (define (namespace-syntax-introduce s)
-  (introduce s 0 (new-core-tip 0 coret)))
+  (introduce s 0 coreb))
  
 (define (expand s)
-  (expand-in-context s (make-expand-context (current-namespace) coret)))
+  (expand-in-context s (make-expand-context (current-namespace) coreb)))
 
 (struct compiled-expression (s-expr)
         #:property prop:custom-write
@@ -29,7 +29,7 @@
                       (expand-in-context
                        (namespace-syntax-introduce
                         (datum->syntax #f s))
-                       (make-expand-context ns coret))
+                       (make-expand-context ns coreb))
                       0
                       ns))))
 
