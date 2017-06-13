@@ -105,14 +105,14 @@
 (define (apply-transformer t s)
   ;; Mark given syntax
   (define m (gensym 't))
-  (define marked-s (mark s m))
+  (define marked-s (mark-pre s m))
   ;; Call the transformer
   ;(printf "before t: ~v\n\n" marked-s)
   (define transformed-s (t marked-s))
   (unless (syntax? transformed-s)
     (error "transformer produced non-syntax:" transformed-s))
   ;(printf "after t: ~v\n\n" t-s)
-  (define after-s (branch-introduced transformed-s m m))
+  (define after-s (mark-post transformed-s m))
   ;(printf "after b: ~v\n\n" after-s)
   after-s)
 
@@ -172,17 +172,15 @@
             ;; Found a variable definition
             (define m (match-syntax exp-body '(define-values (id ...) rhs)))
             (for ([id (in-list (m 'id))])
-              ;; Get the def ctx from the binding variable
-              (define prefix (branch-prev (get-branch id defid (expand-context-phase ctx))))
               (define sym (syntax-e id))
               (define b (bind sym 'var (gensym sym)))
               ;; Add the new binding
               ;(printf "define-values binding ~a\n\n" sym)
-              (add-binding! (cdr bodys) (expand-context-phase ctx) prefix defid b)
-              (add-binding! exp-body (expand-context-phase ctx) prefix defid b)
-              (add-binding! done-trans (expand-context-phase ctx) prefix defid b)
-              (add-binding! done-bodys (expand-context-phase ctx) prefix defid b)
-              (add-binding! val-binds (expand-context-phase ctx) prefix defid b))
+              (add-binding! (cdr bodys) id b defid (expand-context-phase ctx))
+              (add-binding! exp-body id b defid (expand-context-phase ctx))
+              (add-binding! done-trans id b defid (expand-context-phase ctx))
+              (add-binding! done-bodys id b defid (expand-context-phase ctx))
+              (add-binding! val-binds id b defid (expand-context-phase ctx)))
               
             (loop (cdr bodys)
                   done-trans
@@ -205,17 +203,15 @@
             ;; we haven't seen yet.
             (define m (match-syntax exp-body '(define-syntaxes (id ...) rhs)))
             (for ([id (in-list (m 'id))])
-              ;; Get the def ctx from the binding variable
-              (define prefix (branch-prev (get-branch id defid (expand-context-phase ctx))))
               (define sym (syntax-e id))
               (define b (bind sym 'stx #f))
               ;; Add the new binding
               ;(printf "define-syntaxes binding ~a\n\n" sym)
-              (add-binding! (cdr bodys) (expand-context-phase ctx) prefix defid b)
-              (add-binding! exp-body (expand-context-phase ctx) prefix defid b)
-              (add-binding! done-trans (expand-context-phase ctx) prefix defid b)
-              (add-binding! done-bodys (expand-context-phase ctx) prefix defid b)
-              (add-binding! val-binds (expand-context-phase ctx) prefix defid b))
+              (add-binding! (cdr bodys) id b defid (expand-context-phase ctx))
+              (add-binding! exp-body id b defid (expand-context-phase ctx))
+              (add-binding! done-trans id b defid (expand-context-phase ctx))
+              (add-binding! done-bodys id b defid (expand-context-phase ctx))
+              (add-binding! val-binds id b defid (expand-context-phase ctx)))
 
             ;(printf "define-syntaxes (m 'rhs) ~v\n\n" (m 'rhs))
             (define-values (exp-trans transformers)

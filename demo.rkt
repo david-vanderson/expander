@@ -4,7 +4,9 @@
 ;; ----------------------------------------
 
 (define (expand-expression e)
-  (expand (namespace-syntax-introduce (datum->syntax #f e))))
+  (define t (namespace-syntax-introduce (datum->syntax #f e)))
+  ;(printf "t ~v\n\n" t)
+  (expand t))
 
 (define (compile+eval-expression e)
   (define exp (expand-expression e))

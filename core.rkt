@@ -9,7 +9,7 @@
 (provide coreb)
 
 
-(define coreb (branch 'core '() #f))
+(define coreb (branch 'core '()))
 
 (define-syntax (append-core! stx)
   (syntax-case stx ()
@@ -81,21 +81,16 @@
   ;; Parse and check formal arguments:
   (define ids (parse-and-flatten-formals formals))
   (check-no-duplicate-ids ids (expand-context-phase ctx))
-
-  (define prefixes
-    (for/list ([id (in-list ids)])
-      (hash-ref (syntax-branches id) (expand-context-phase ctx))))
   
-  (define bid (gensym 'lambda))
-  (set! ids (extend-branch ids bid (expand-context-phase ctx)))
-  (set! bodys (extend-branch bodys bid (expand-context-phase ctx)))
-  (for ([id (in-list ids)]
-        [prefix (in-list prefixes)])
+  (define branchid (gensym 'lambda))
+  (set! ids (extend-branch ids branchid (expand-context-phase ctx)))
+  (set! bodys (extend-branch bodys branchid (expand-context-phase ctx)))
+  (for ([id (in-list ids)])
     (define sym (syntax-e id))
     (define b (bind sym 'var (gensym sym)))
     ;; Add the new binding
-    (add-binding! ids (expand-context-phase ctx) prefix bid b)
-    (add-binding! bodys (expand-context-phase ctx) prefix bid b))
+    (add-binding! ids id b branchid (expand-context-phase ctx))
+    (add-binding! bodys id b branchid (expand-context-phase ctx)))
 
   ;; Expand the function body:
   ;(define exp-body (expand (car bodys) ctx))
@@ -159,53 +154,36 @@
               (expand rhs ctx))))
 
     ;; do the binding part
-    ; get prefixes before we extend the branches
-    (define trans-prefixes
-      (for/list ([ids (in-list transids)])
-        (for/list ([id (in-list ids)])
-          (hash-ref (syntax-branches id) (expand-context-phase ctx)))))
-    
-    (define val-prefixes
-      (for/list ([ids (in-list valids)])
-        (for/list ([id (in-list ids)])
-          (hash-ref (syntax-branches id) (expand-context-phase ctx)))))
-    ;(printf "val-prefixes ~v\n" val-prefixes)
-
-    (define bid (gensym letsym))
-    (set! transids (extend-branch transids bid (expand-context-phase ctx)))
-    (when rec? (set! transs (extend-branch transs bid (expand-context-phase ctx))))
-    (set! valids (extend-branch valids bid (expand-context-phase ctx)))
-    (when rec? (set! valrhs (extend-branch valrhs bid (expand-context-phase ctx))))
-    (set! bodys (extend-branch bodys bid (expand-context-phase ctx)))
+    (define branchid (gensym letsym))
+    (set! transids (extend-branch transids branchid (expand-context-phase ctx)))
+    (when rec? (set! transs (extend-branch transs branchid (expand-context-phase ctx))))
+    (set! valids (extend-branch valids branchid (expand-context-phase ctx)))
+    (when rec? (set! valrhs (extend-branch valrhs branchid (expand-context-phase ctx))))
+    (set! bodys (extend-branch bodys branchid (expand-context-phase ctx)))
     
     (for ([ids (in-list transids)]
-          [pids (in-list trans-prefixes)]
           [trans (in-list (if rec? transids transs))])
       (for ([id (in-list ids)]
-            [pid (in-list pids)]
             [t (in-list trans)])
         (define sym (syntax-e id))
         (define b (bind sym 'stx (if rec? #f t)))
         ;; Add the new binding
-        (add-binding! transids (expand-context-phase ctx) pid bid b)
-        (when rec? (add-binding! transs (expand-context-phase ctx) pid bid b))
-        (add-binding! valids (expand-context-phase ctx) pid bid b)
-        (when rec? (add-binding! valrhs (expand-context-phase ctx) pid bid b))
-        (add-binding! bodys (expand-context-phase ctx) pid bid b)))
+        (add-binding! transids id b branchid (expand-context-phase ctx))
+        (when rec? (add-binding! transs id b branchid (expand-context-phase ctx)))
+        (add-binding! valids id b branchid (expand-context-phase ctx))
+        (when rec? (add-binding! valrhs id b branchid (expand-context-phase ctx)))
+        (add-binding! bodys id b branchid (expand-context-phase ctx))))
 
-    (for ([ids (in-list valids)]
-          [pids (in-list val-prefixes)])
-      (for ([id (in-list ids)]
-            [pid (in-list pids)])
+    (for ([ids (in-list valids)])
+      (for ([id (in-list ids)])
         (define sym (syntax-e id))
         (define b (bind sym 'var (gensym sym)))
         ;; Add the new binding
-        (add-binding! transids (expand-context-phase ctx) pid bid b)
-        (when rec? (add-binding! transs (expand-context-phase ctx) pid bid b))
-        (add-binding! valids (expand-context-phase ctx) pid bid b)
-        (when rec? (add-binding! valrhs (expand-context-phase ctx) pid bid b))
-        ;(printf "add-binding! to ~v\n" (map syntax->datum bodys))
-        (add-binding! bodys (expand-context-phase ctx) pid bid b)))
+        (add-binding! transids id b branchid (expand-context-phase ctx))
+        (when rec? (add-binding! transs id b branchid (expand-context-phase ctx)))
+        (add-binding! valids id b branchid (expand-context-phase ctx))
+        (when rec? (add-binding! valrhs id b branchid (expand-context-phase ctx)))
+        (add-binding! bodys id b branchid (expand-context-phase ctx))))
 
     (when rec?
       ;; expand+eval trans-rhs after binding
@@ -260,22 +238,17 @@
                          ; car because this returns a list of the values produced,
                          ; and let-syntax only supports a single value
                          (car (eval-for-syntaxes-binding rhs tids ctx))))
-
-    (define prefixes
-      (for/list ([id (in-list tids)])
-        (hash-ref (syntax-branches id) (expand-context-phase ctx))))
   
-    (define bid (gensym 'let-syntax))
-    (set! tids (extend-branch tids bid (expand-context-phase ctx)))
-    (set! body (extend-branch body bid (expand-context-phase ctx)))
+    (define branchid (gensym 'let-syntax))
+    (set! tids (extend-branch tids branchid (expand-context-phase ctx)))
+    (set! body (extend-branch body branchid (expand-context-phase ctx)))
     (for ([id (in-list tids)]
-          [prefix (in-list prefixes)]
           [t (in-list trans-vals)])
       (define sym (syntax-e id))
       (define b (bind sym 'stx t))
       ;; Add the new binding
-      (add-binding! tids (expand-context-phase ctx) prefix bid b)
-      (add-binding! body (expand-context-phase ctx) prefix bid b))
+      (add-binding! tids id b branchid (expand-context-phase ctx))
+      (add-binding! body id b branchid (expand-context-phase ctx)))
     
     ;; Expand body
     (define exp-body (expand body ctx))

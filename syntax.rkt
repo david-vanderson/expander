@@ -13,7 +13,8 @@
 
 (struct syntax (e      ; datum and nested syntax objects
                 marks  ; stack of unique ids used to distinguish macro-introduced syntax
-                branches  ; hash of branch heads, one for each phase
+                marks-pre  ; stack of macro ids we haven't come out of yet
+                branches  ; hash of branch lists, one for each phase
                 srcloc ; source location
                 props) ; properties
         ;; Custom printer:
@@ -41,12 +42,9 @@
 (define (datum->syntax stx-c v [stx-l #f] [stx-p #f])
   (define (wrap e)
     (syntax e
-            (if stx-c
-                (syntax-marks stx-c)
-                null)
-            (if stx-c
-                (syntax-branches stx-c)
-                empty-branches)
+            (if stx-c (syntax-marks stx-c) null)
+            (if stx-c (syntax-marks-pre stx-c) null)
+            (if stx-c (syntax-branches stx-c) empty-branches)
             (and stx-l (syntax-srcloc stx-l))
             (if stx-p (syntax-props stx-p) empty-props)))
   (cond

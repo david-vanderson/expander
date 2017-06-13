@@ -1,6 +1,5 @@
 #lang racket/base
-(require "syntax.rkt"
-         "expand-context.rkt")
+(require "syntax.rkt")
 
 (provide resolve
          bound-identifier=?
@@ -9,11 +8,11 @@
 
          (struct-out bind)
          (struct-out branch)
-         get-branch
          extend-branch
          add-binding!
-         mark
-         branch-introduced)
+         mark-pre
+         mark-post
+         )
 
 ;; Each syntax object has as pointer (for each phase) to the
 ;; binding branch tip that represents bindings that affect it.
@@ -32,8 +31,7 @@
 
 ;; branch is mutable for definition contexts
 (struct branch (id       ; unique id for this binding context
-                [binds #:mutable]  ; list of binds
-                prev)    ; #f or branch that this branch extends
+                [binds #:mutable])  ; list of binds
   #;#:transparent)
 
 ;; type 'var  -> val is gensym for local variable
@@ -48,6 +46,24 @@
   #;#:transparent)
 
 
+;; syntax s1 could bind s1 if they have the same marks and marks-pre
+(define (could-bind? s1 s2)
+  (and (equal? (syntax-marks s1) (syntax-marks s2))
+       (equal? (syntax-marks-pre s1) (syntax-marks-pre s2))))
+
+
+;; a will bind b if they have the same symbol, marks, and marks-pre
+;; binding is reflexive
+(define (bound-identifier=? a b phase)
+  (and (equal? (syntax-e a) (syntax-e b))
+       (could-bind? a b)))
+
+
+(define (free-identifier=? a b phase)
+  ; do these resolve to the same binding?
+  (eq? (resolve a phase) (resolve b phase)))
+
+
 (define (syntax-map s f)
   (let loop ((s s))
     (cond
@@ -59,13 +75,13 @@
       [else s])))
 
 
-(define (introduce s phase branch-head)
+(define (introduce s phase branch)
   (syntax-map s
     (lambda (s)
       (when (hash-has-key? (syntax-branches s) phase)
         (error "already have a branch head for this phase" phase s))
       (struct-copy syntax s
-                   [branches (hash-set (syntax-branches s) phase branch-head)]))))
+                   [branches (hash-set (syntax-branches s) phase (list branch))]))))
 
 (define (extend-branch s id phase)
   (syntax-map s
@@ -75,47 +91,38 @@
       ;  (printf "~a adding ~a branch ~a\n" phase (syntax-e s) id))
       (struct-copy syntax s
                    [branches (hash-set (syntax-branches s) phase
-                                       (branch id '() bh))]))))
+                                       (cons (branch id '()) bh))]))))
 
-(define (get-branch s id phase)
+
+(define (get-branch s phase id)
   (let loop ((b (hash-ref (syntax-branches s) phase 'missing)))
     (cond
       [(equal? b 'missing)
        ; this syntax doesn't have a branch in this phase (literals, parenthesis)
        #f]
-      [(not b)  ; hit the end
+      [(null? b)  ; hit the end
        #f]
-      [(equal? id (branch-id b))
-       b]  ; found it
+      [(equal? id (branch-id (car b)))
+       (car b)]  ; found it
       [else
-       (loop (branch-prev b))])))
-
-(define (branches-equal? a b)
-  (cond
-    [(and (not a) (not b))
-     #t]
-    [(and a b (equal? (branch-id a) (branch-id b)))
-     (branches-equal? (branch-prev a) (branch-prev b))]
-    [else
-     #f]))
+       (loop (cdr b))])))
       
 
-;; For all syntax s, if it has a branch with branchid-prefix somewhere,
+;; For all syntax s, if (could-bind? id s)
 ;; then we are binding it, which means add bind to the list of binds
-;; in the branch branchid-to-bind
-(define (add-binding! s phase branch-prefix branchid-to-bind bind)
+;; in the branch identified by branchid
+(define (add-binding! s id bind branchid phase)
   (let loop ((s s))
     ;(printf "  add-binding ~v\n" s)
     (cond
       [(syntax? s)
-       (define b (get-branch s (branch-id branch-prefix) phase))
-       (when (branches-equal? branch-prefix b)
-         ;(when (identifier? s)
-         ;  (printf "~a add-binding! ~a bind ~a prefix ~a in ~a\n"
-         ;          phase (syntax-e s) (bind-id bind) (branch-id branch-prefix) branchid-to-bind))
-         
-         (define b (get-branch s branchid-to-bind phase))
-         (set-branch-binds! b (cons bind (branch-binds b))))
+       (when (could-bind? id s)
+         (define b (get-branch s phase branchid))
+         (when b
+           ;(when (identifier? s)
+           ;  (printf "~a add-binding! ~a bind ~a in ~a\n"
+           ;          phase (syntax-e s) (bind-id bind) branchid))
+           (set-branch-binds! b (cons bind (branch-binds b)))))
        (loop (syntax-e s))]
       [(list? s) (map loop s)]
       [(pair? s) (cons (loop (car s))
@@ -123,62 +130,41 @@
       [else s])))
 
 
-;; I'm not sure bound-identifier=? can always be reflective
-;; This implementation will work for syntax that hasn't been expanded before
-;; but for already-expanded syntax we need something else
-(define (bound-identifier=? a b phase)
-  ; do these live on the same tip, so that binding one will affect the other?
-  (and (eq? (syntax-e a) (syntax-e b))
-       (let ((ba (hash-ref (syntax-branches a) phase #f))
-             (bb (hash-ref (syntax-branches b) phase #f)))
-         (and ba bb  ; must have branches
-              (eq? ba bb)))))
-
-
-(define (free-identifier=? a b phase)
-  ; do these resolve to the same binding?
-  ; possibly through different branches that join as you go back
-  (eq? (resolve a phase) (resolve b phase)))
-
-
 (define (resolve id phase (err? #f))
   (let loop ((b (hash-ref (syntax-branches id) phase)))
     (cond
-      [(not b)  ; ran out of branches
+      [(null? b)  ; ran out of branches
        (if err?
            (error "unbound identifier in phase:" phase id)
            #f)]
       [else
        (define bind (findf (lambda (idbind) (equal? (syntax-e id) (bind-id idbind)))
-                           (branch-binds b)))
+                           (branch-binds (car b))))
        (if bind
            bind
-           (loop (branch-prev b)))])))
+           (loop (cdr b)))])))
 
 ;; ------------------------------------------
 
 ;; set a mark m on all syntax going into a macro
-(define (mark s m)
+(define (mark-pre s m)
   (syntax-map s
     (lambda (s)
       (struct-copy syntax s
-                   [marks (cons m (syntax-marks s))]))))
+                   [marks-pre (cons m (syntax-marks-pre s))]))))
 
-;; branch all macro-introduced syntax (top mark is not m)
-(define (branch-introduced s m branchid)
+;; for syntax coming out of a macro
+;; if marks-pre has m, remove it (syntax was argument to macro)
+;; if not, add it to marks (syntax was introduced)
+(define (mark-post s m)
   (syntax-map s
     (lambda (s)
-      (define intro? (or (null? (syntax-marks s))
-                         (not (equal? m (car (syntax-marks s))))))
+      (define gotm? (and (not (null? (syntax-marks-pre s)))
+                         (equal? m (car (syntax-marks-pre s)))))
       (struct-copy syntax s
-                   [marks (if intro?
+                   [marks-pre (if gotm?
+                                  (cdr (syntax-marks-pre s))
+                                  (syntax-marks-pre s))]
+                   [marks (if gotm?
                               (syntax-marks s)
-                              (cdr (syntax-marks s)))]
-                   [branches
-                    (cond
-                      [(not intro?) (syntax-branches s)]
-                      [else
-                       (for/hash ([(p b) (in-hash (syntax-branches s))])
-                         ;(when (identifier? s)
-                         ;  (printf "~a branch ~a from ~a to ~a\n" p (syntax-e s) (branch-id b) branchid))
-                         (values p (branch branchid '() b)))])]))))
+                              (cons m (syntax-marks s)))]))))
