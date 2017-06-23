@@ -7,44 +7,28 @@
          "match.rkt"
          "namespace.rkt")
 
-(provide core-stx
-         
-         add-core-form!
+(provide add-core-form!
          add-core-primitive!
          
          declare-core-module!
          
          core-form-sym)
 
-;; Accumulate all core bindings in `core-scope`, so we can
-;; easily generate a reference to a core form using `core-stx`:
-(define core-scope (new-multi-scope))
-(define core-stx (add-scope empty-syntax core-scope))
-
-;; Core forms and primitives are added by `require`s in "expander.rkt"
+;; Core forms and primitives are added by `require`s in "main.rkt"
 
 ;; Accumulate added core forms and primitives:
 (define core-forms #hasheq())
 (define core-primitives #hasheq())
 
 (define (add-core-form! sym proc)
-  (add-core-binding! sym)
   (set! core-forms (hash-set core-forms
                              sym
                              proc)))
 
 (define (add-core-primitive! sym val)
-  (add-core-binding! sym)
   (set! core-primitives (hash-set core-primitives
                                   sym
                                   val)))
-
-(define (add-core-binding! sym)
-  (add-binding! (datum->syntax core-stx sym)
-                (module-binding '#%core 0 sym
-                                '#%core 0 sym
-                                0)
-                0))
 
 ;; Used only after filling in all core forms and primitives:
 (define (declare-core-module! ns)

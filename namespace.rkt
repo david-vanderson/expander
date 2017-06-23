@@ -8,7 +8,8 @@
          namespace->module
          
          namespace-syntax-introduce
-         namespace-scope
+         namespace-branches
+         set-namespace-prephase-branchids!
          
          make-module
          declare-module!
@@ -24,7 +25,8 @@
          namespace-get-variable
          namespace-get-transformer)
 
-(struct namespace (scope               ; scope for top-level bindings
+(struct namespace (branches            ; scope for top-level bindings, mutable hash
+                   [prephase-branchids #:mutable]
                    phases              ; phase-level -> definitions
                    module-declarations ; resolved-module-name -> module
                    submodule-declarations ; resolved-module-name -> module
@@ -43,7 +45,8 @@
                 instantiate))  ; namespace phase phase-level ->
 
 (define (make-empty-namespace)
-  (namespace (new-multi-scope)
+  (namespace (make-hash)
+             null
              (make-hasheqv)
              (make-hash)
              (make-hash)
@@ -52,7 +55,7 @@
 (define current-namespace (make-parameter (make-empty-namespace)))
 
 (define (namespace-syntax-introduce s [ns (current-namespace)])
-  (add-scope s (namespace-scope ns)))
+  (introduce s (namespace-branches ns) (namespace-prephase-branchids ns)))
 
 (define (make-module-namespace ns name for-submodule?)
   (define m-ns
@@ -111,7 +114,8 @@
            (let ([m (namespace->module ns name)])
              (unless m
                (error "no module declared to instantiate:" name))
-             (define m-ns (namespace (new-multi-scope)
+             (define m-ns (namespace (make-hash)
+                                     null
                                      (make-hasheqv)
                                      (namespace-module-declarations ns)
                                      (namespace-submodule-declarations ns)

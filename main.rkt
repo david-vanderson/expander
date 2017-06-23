@@ -1,6 +1,7 @@
 #lang racket/base
 (require "syntax.rkt"
          "scope.rkt"
+         "binding.rkt"
          "namespace.rkt"
          "core.rkt"
          "require+provide.rkt"
@@ -25,12 +26,20 @@
   ns)
 
 (define (namespace-require req ns)
+  (define branchid (gensym 'namespace-req))
+  (define s (empty-syntax))
+  (set! s (namespace-syntax-introduce s ns))
+  (set! s (extend-branch s branchid 'all))
   (parse-and-perform-requires! #:run? #t
-                               (list (add-scope (datum->syntax #f req)
-                                                (namespace-scope ns)))
+                               (list (datum->syntax #f req))
+                               branchid s
                                #f ns
                                0
-                               (make-requires+provides)))
+                               (make-requires+provides))
+  (hash-clear! (namespace-branches ns))
+  (for ([(p b) (in-hash (syntax-branches s))])
+    (hash-set! (namespace-branches ns) p b))
+  (set-namespace-prephase-branchids! ns (syntax-prephase-branchids s)))
 
 (define (expand s [ns (current-namespace)])
   (expand-in-context s (make-expand-context ns)))

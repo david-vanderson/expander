@@ -183,8 +183,8 @@
    ()
    (m)))
 
-"`(quote-syntax .... #:local)` doesn't prune"
-(eval-expression
+;"`(quote-syntax .... #:local)` doesn't prune"
+#;(eval-expression
  #:check 'bound-2
  '(letrec-syntaxes+values
    ([(m)

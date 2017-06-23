@@ -50,46 +50,56 @@
    (unless (or keep-enclosing-scope-at-phase
                (module-path? initial-require))
      (error "not a module path:" (m 'initial-require)))
-   
-   (define outside-scope (new-scope))
-   (define inside-scope (new-multi-scope))
-   (define new-module-scopes (append (list inside-scope outside-scope)
-                                     (if keep-enclosing-scope-at-phase
-                                         (expand-context-module-scopes ctx)
-                                         null)))
 
    (define self (build-module-name (syntax-e (m 'id:module-name)) enclosing-self))
    (define m-ns (make-module-namespace (expand-context-namespace ctx)
                                        self
                                        (and enclosing-self #t)))
+
+  (define branchid-req (gensym 'modreq))  ;; branch holding module requires
+  (define branchid-mod (gensym 'mod))     ;; branch holding module definitions, shadows requires
+  (define initreq (m 'initial-require))
+  (define bodys (m 'body))
    
-   (define apply-module-scopes
-     (make-apply-module-scopes outside-scope inside-scope 
-                               ctx keep-enclosing-scope-at-phase))
-
-   ;; Add the module's scope to the bodies
-   (define bodys (map apply-module-scopes (m 'body)))
-
    ;; To keep track of all requires and provides
    (define requires+provides (make-requires+provides))
 
    ;; Initial require
    (cond
     [(not keep-enclosing-scope-at-phase)
+     ;; Wipe the existing context we got from enclosing module
+     (set! initreq (introduce initreq (syntax-branches (empty-syntax))
+                              (syntax-prephase-branchids (empty-syntax)) #f))
+     (set! bodys (introduce bodys (syntax-branches (empty-syntax))
+                            (syntax-prephase-branchids (empty-syntax)) #f))
+     ;; Add new branch for this module
+     (set! initreq (extend-branch initreq branchid-req 'all))
+     (set! initreq (extend-branch initreq branchid-mod 'all))
+     (set! bodys (extend-branch bodys branchid-req 'all))
+     (set! bodys (extend-branch bodys branchid-mod 'all))
+     
      ;; Install the initial require
      (perform-initial-require! initial-require self
-                               (apply-module-scopes (m 'initial-require))
+                               initreq branchid-req bodys
                                m-ns
                                requires+provides)]
     [else
      ;; For `(module* name #f ....)`, just register the enclosing module
      ;; as an import and visit it
+
+     ;; Add new branch for this module
+     (set! initreq (extend-branch initreq branchid-req 'all))
+     (set! initreq (extend-branch initreq branchid-mod 'all))
+     (set! bodys (extend-branch bodys branchid-req 'all))
+     (set! bodys (extend-branch bodys branchid-mod 'all))
+
      (add-required-module! requires+provides
                            enclosing-self
                            keep-enclosing-scope-at-phase)
      (namespace-module-visit! m-ns enclosing-self keep-enclosing-scope-at-phase)])
 
-   ;; All module bodies start at phase 0
+
+  ;; All module bodies start at phase 0
    (define phase 0)
    
    ;; The primitive `#%module-begin` form calls this function to expand the
@@ -105,9 +115,9 @@
      ;; In case `#%module-begin` expansion is forced on syntax that
      ;; that wasn't already introduced into the mdoule's inside scope,
      ;; add it to all the given body forms
-     (define bodys
-       (for/list ([body (in-list (mb-m 'body))])
-         (add-scope body inside-scope)))
+     ;(define bodys
+     ;  (for/list ([body (in-list (mb-m 'body))])
+     ;    (add-scope body inside-scope)))
      
      ;; The expansion of the module body happens in 4 passes:
      ;;  Pass 1: Partial expansion to determine imports and definitions
@@ -117,7 +127,7 @@
      
      ;; Passes 1 and 2 are nested via `begin-for-syntax`:
      (define expression-expanded-bodys
-       (let pass-1-and-2-loop ([bodys bodys] [phase phase])
+       (let pass-1-and-2-loop ([bodys (mb-m 'body)] [phase phase] [bodys-to-bind (mb-m 'body)])
 
          ;; - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
          ;; Pass 1: partially expand to discover all bindings and install all 
@@ -127,12 +137,11 @@
                                                [context 'module]
                                                [phase phase]
                                                [namespace m-ns]
-                                               [only-immediate? #t]
-                                               [post-expansion-scope inside-scope]
-                                               [module-scopes new-module-scopes]))
+                                               [only-immediate? #t]))
          
          (define partially-expanded-bodys
            (partially-expand-bodys bodys
+                                   branchid-req branchid-mod bodys-to-bind
                                    #:original s
                                    #:phase phase
                                    #:ctx partial-body-ctx
@@ -145,8 +154,7 @@
          ;; Pass 2: finish expanding expressions
          
          (define body-ctx (struct-copy expand-context partial-body-ctx
-                                       [only-immediate? #f]
-                                       [post-expansion-scope #f]))
+                                       [only-immediate? #f]))
          
          (finish-expanding-body-expressons partially-expanded-bodys
                                            #:phase phase
@@ -167,8 +175,7 @@
      ;; Pass 4: expand `module*` submodules
      
      (define submod-ctx (struct-copy expand-context ctx
-                                     [namespace m-ns]
-                                     [module-scopes new-module-scopes]))
+                                     [namespace m-ns]))
      
      (define declare-enclosing-module
        ;; Ensure this module on demand for `module*` submodules that might use it
@@ -198,10 +205,12 @@
    
    ;; The preceding function performs the expansion; here's where we
    ;; trigger it
+  (when (null? bodys)
+    (error "no module body forms:" s))
       
    ;; Add `#%module-begin` around the body if it's not already present
    (define mb
-     (ensure-module-begin bodys inside-scope new-module-scopes ctx phase s))
+     (ensure-module-begin bodys ctx phase s))
    
    ;; Expand the body
    (define expanded-mb
@@ -209,9 +218,7 @@
              (struct-copy expand-context ctx
                           [context 'module-begin]
                           [namespace m-ns]
-                          [module-scopes new-module-scopes]
-                          [module-begin-k module-begin-k]
-                          [use-site-scopes (box null)])))
+                          [module-begin-k module-begin-k])))
    
    ;; - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
    ;; Assemble the `module` result
@@ -226,7 +233,7 @@
 ;; ----------------------------------------
 
 ;; Add `#%module-begin` to `bodys`, if needed
-(define (ensure-module-begin bodys inside-scope new-module-scopes ctx phase s)
+(define (ensure-module-begin bodys ctx phase s)
   (cond
    [(= 1 (length bodys))
     ;; Maybe it's already a `#%module-begin` form, or maybe it
@@ -241,57 +248,35 @@
       (define partly-expanded-body
         (expand (car bodys) (struct-copy expand-context ctx
                                          [context 'module-begin]
-                                         [only-immediate? #t]
-                                         [post-expansion-scope inside-scope]
-                                         [module-scopes new-module-scopes])))
+                                         [only-immediate? #t])))
       (cond
        [(eq? '#%module-begin (core-form-sym partly-expanded-body phase))
         ;; Yes, it expanded to `#%module-begin`
         partly-expanded-body]
        [else
         ;; No, it didn't expand to `#%module-begin`
-        (add-module-begin (list partly-expanded-body) s new-module-scopes phase)])])]
+        (add-module-begin (list partly-expanded-body) s phase)])])]
    [else
     ;; Multiple body forms definitely need a `#%module-begin` wrapper
-    (add-module-begin bodys s new-module-scopes phase)]))
+    (add-module-begin bodys s phase)]))
 
 ;; Add `#%module-begin`, because it's needed
-(define (add-module-begin bodys s new-module-scopes phase)
-  (define mb-id (add-scopes (datum->syntax #f '#%module-begin)
-                            new-module-scopes))
+(define (add-module-begin bodys s phase)
+  (define mb-id (datum->syntax (car bodys) '#%module-begin))
   ;; If `mb-id` is not bound, we'd like to give a clear error message
   (unless (resolve mb-id phase)
     (error "no #%module-begin binding in the module's language" s))
   (rebuild
-   s
+   (car bodys)
    `(,mb-id ,@bodys)))
            
-;; ----------------------------------------
-
-;; Make function to adjust syntax that appears in the original module body
-(define (make-apply-module-scopes inside-scope outside-scope
-                                  ctx keep-enclosing-scope-at-phase)
-  (lambda (s)
-    (define s-without-enclosing
-      (if keep-enclosing-scope-at-phase
-          ;; Keep enclosing module scopes for `(module* _ #f ....)`
-          s
-          ;; Remove the scopes of the top level or a module outside of
-          ;; this module, as well as any relevant use-site scopes
-          (remove-use-site-scopes
-           (for/fold ([s s]) ([sc (in-list (expand-context-module-scopes ctx))])
-             (remove-scope s sc))
-           ctx)))
-    ;; Add outside- and inside-edge scopes
-    (add-scope (add-scope s-without-enclosing
-                          outside-scope)
-               inside-scope)))
 
 ;; ----------------------------------------
 
 ;; Pass 1 of `module` expansion, which uncovers definitions,
 ;; requires, and `module` submodules
 (define (partially-expand-bodys bodys
+                                branchid-req branchid-mod extra-bodys-to-bind
                                 #:original s
                                 #:phase phase
                                 #:ctx partial-body-ctx
@@ -302,74 +287,82 @@
   ;; Table of symbol picked for each binding in this module:
   (define defined-syms (make-hasheq))
   
-  (let loop ([bodys bodys])
+  (let loop ([bodys bodys]
+             [done-bodys null])
     (cond
-     [(null? bodys) null]
+     [(null? bodys) (reverse done-bodys)]
      [else
       (define exp-body (expand (car bodys) partial-body-ctx))
+      (define bind-stx (list exp-body (cdr bodys) done-bodys extra-bodys-to-bind))
       (case (core-form-sym exp-body phase)
         [(begin)
          (define m (match-syntax exp-body '(begin e ...)))
-         (loop (append (m 'e) (cdr bodys)))]
+         (loop (cdr bodys) (cons (m 'e) done-bodys))]
         [(begin-for-syntax)
          (define m (match-syntax exp-body '(begin-for-syntax e ...)))
-         (define nested-bodys (pass-1-and-2-loop (m 'e) (add1 phase)))
+         (define nested-bodys (pass-1-and-2-loop (m 'e) (add1 phase) (list (cdr bodys) done-bodys extra-bodys-to-bind)))
          (eval-nested-bodys nested-bodys (add1 phase) m-ns self)
-         (cons
-          (rebuild
-           s
-           `(,(m 'begin-for-syntax) ,@nested-bodys))
-          (loop (cdr bodys)))]
+         (loop (cdr bodys)
+               (cons
+                (rebuild
+                 s
+                 `(,(m 'begin-for-syntax) ,@nested-bodys))
+                done-bodys))]
         [(define-values)
          (define m (match-syntax exp-body '(define-values (id ...) rhs)))
-         (define ids (remove-use-site-scopes (m 'id) partial-body-ctx))
-         (check-ids-unbound ids phase requires+provides)
-         (define syms (select-defined-syms-and-bind ids defined-syms self phase
+         (check-ids-unbound (m 'id) phase requires+provides)
+         (define syms (select-defined-syms-and-bind (m 'id) bind-stx
+                                                    branchid-mod defined-syms self phase
                                                     requires+provides))
-         (cons exp-body
-               (loop (cdr bodys)))]
+         (loop (cdr bodys)
+               (cons exp-body done-bodys))]
         [(define-syntaxes)
          (define m (match-syntax exp-body '(define-syntaxes (id ...) rhs)))
-         (define ids (remove-use-site-scopes (m 'id) partial-body-ctx))
-         (check-ids-unbound ids phase requires+provides)
-         (define syms (select-defined-syms-and-bind ids defined-syms self phase
+         (check-ids-unbound (m 'id) phase requires+provides)
+         (define syms (select-defined-syms-and-bind (m 'id) bind-stx
+                                                    branchid-mod defined-syms self phase
                                                     requires+provides))
          ;; Expand and evaluate RHS:
          (define-values (exp-rhs vals)
-           (expand+eval-for-syntaxes-binding (m 'rhs) ids partial-body-ctx))
+           (expand+eval-for-syntaxes-binding (m 'rhs) (m 'id) partial-body-ctx))
          ;; Install transformers in the namespace for expansion:
          (for ([key (in-list syms)]
                [val (in-list vals)])
            (namespace-set-transformer! m-ns phase key val))
-         (cons (rebuild exp-body
-                        `(,(m 'define-syntaxes) ,ids ,exp-rhs))
-               (loop (cdr bodys)))]
+         (loop (cdr bodys)
+               (cons (rebuild exp-body
+                              `(,(m 'define-syntaxes) ,(m 'id) ,exp-rhs))
+                     done-bodys))]
         [(#%require)
-         (define ready-body (remove-use-site-scopes exp-body partial-body-ctx))
-         (define m (match-syntax ready-body '(#%require req ...)))
-         (parse-and-perform-requires! (m 'req) self
-                                      m-ns phase
+         (define m (match-syntax exp-body '(#%require req ...)))
+         (parse-and-perform-requires! (m 'req) branchid-req bind-stx
+                                      self m-ns phase
                                       requires+provides)
-         (cons exp-body
-               (loop (cdr bodys)))]
+         (loop (cdr bodys)
+               (cons exp-body
+                     done-bodys))]
         [(#%provide)
          ;; save for last pass
-         (cons exp-body
-               (loop (cdr bodys)))]
+         (loop (cdr bodys)
+               (cons exp-body
+                     done-bodys))]
         [(module)
          ;; Submodule to parse immediately
          (define submod
            (expand-submodule exp-body self partial-body-ctx))
-         (cons submod
-               (loop (cdr bodys)))]
+         (loop (cdr bodys)
+               (cons submod
+                     done-bodys))]
         [(module*)
          ;; Submodule to save for after this module
-         (cons exp-body
-               (loop (cdr bodys)))]
+         (loop (cdr bodys)
+               (cons exp-body
+                     done-bodys))]
         [else
          ;; save expression for next pass
-         (cons exp-body
-               (loop (cdr bodys)))])])))
+         (loop (cdr bodys)
+               (cons exp-body
+                     done-bodys))])])))
 
 ;; ----------------------------------------
 
@@ -444,7 +437,7 @@
                    requires+provides
                    (datum->syntax
                     #f
-                    `(,(datum->syntax core-stx 'module) ,(m 'id:module-name) ,(m 'initial-require)
+                    `(,(core-literal 'module 0) ,(m 'id:module-name) ,(m 'initial-require)
                       (,(mb-m '#%module-begin)
                        ,@fully-expanded-bodys-except-post-submodules)))
                    self))
@@ -501,7 +494,7 @@
   (for ([id (in-list ids)])
     (check-not-required-or-defined requires+provides id phase)))
 
-(define (select-defined-syms-and-bind ids defined-syms self phase
+(define (select-defined-syms-and-bind ids stx branchid defined-syms self phase
                                       requires+provides)
   (for/list ([id (in-list ids)])
     (define sym (syntax-e id))
@@ -517,7 +510,7 @@
     (define b (module-binding self phase local-sym
                               self phase local-sym
                               0))
-    (add-binding! id b phase)
+    (add-binding! stx id b branchid phase)
     (add-defined-or-required-id! requires+provides id phase b)
     local-sym))
 
@@ -557,8 +550,7 @@
     (expand-module s
                    (struct-copy expand-context ctx
                                 [context 'module]
-                                [only-immediate? #f]
-                                [post-expansion-scope #f])
+                                [only-immediate? #f])
                    self
                    #:keep-enclosing-scope-at-phase keep-enclosing-scope-at-phase))
   

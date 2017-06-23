@@ -1,225 +1,178 @@
 #lang racket/base
-(require racket/set
-         racket/list
-         "syntax.rkt"
-         "phase.rkt")
+(require "syntax.rkt")
 
-(provide new-scope
-         new-multi-scope
-         add-scope
-         add-scopes
-         remove-scope
-         remove-scopes
-         flip-scope
-         
-         syntax-shift-phase-level
-         
-         add-binding-in-scopes!
+(provide resolve
+         bound-identifier=?
+         introduce
+
+         extend-branch
          add-binding!
-         resolve
-         
-         bound-identifier=?)
+         mark-pre
+         mark-post
+         )
 
-;; A scope represents a distinct "dimension" of binding. We can attach
-;; the bindings for a set of scopes to an arbitrary scope in the set;
-;; we pick the most recently allocated scope to make a binding search
-;; faster and to improve GC, since non-nested binding contexts will
-;; generally not share a most-recent scope.
+;; Each syntax object has a branch list for each phase that
+;; contains all the bindings that affect it.  Resolve an identifier
+;; by finding the first bind in the list with the same symbol.
 
-(struct scope (id          ; internal scope identity; used for sorting
-               bindings)   ; sym -> scope-set -> binding
-        ;; Custom printer:
-        #:property prop:custom-write
-        (lambda (sc port mode)
-          (write-string "#<scope:" port)
-          (display (scope-id sc) port)
-          (write-string ">" port)))
+;; As we expand a binding context, we add a branch to the start of
+;; every syntax's branch list in that context and phase.  Then for
+;; each identifier being bound, we see if that identifier could-bind?
+;; each syntax, and if so, we add the new bind to that syntax's branch.
 
-;; A "multi-scope" represents a group of scopes, each of which exists
-;; only at a specific phase, and each in a distinct phase. This
-;; infinite group of scopes is realized on demand. A multi-scope is
-;; used to represent the inside of a module, where bindings in
-;; different phases are distinguished by the different scopes within
-;; the module's multi-scope.
-;;
-;; To compute a syntax's set of scopes at a given phase, the
-;; phase-specific representative of the multi scope is combined with
-;; the phase-independent scopes. Since a multi-scope corresponds to
-;; a module, the number of multi-scopes in a syntax is expected to
-;; be small.
-(struct multi-scope (scopes)) ; phase -> representative-scope
-(struct representative-scope scope (owner   ; a multi-scope for which this one is a phase-specific identity
-                                    phase)) ; phase of this scope
-(struct shifted-multi-scope (phase        ; phase shift applies to all scopes in multi-scope
-                             multi-scope) ; a multi-scope
-        #:transparent)
+;; For each macro invocation, we take introduced syntax and add a unique
+;; mark.  could-bind? only works for syntax with equal marks.  This creates
+;; the extra dimension of binding that hygiene requires.
 
-;; Each new scope increments the counter, so we can check whether one
-;; scope is newer than another.
-(define id-counter 0)
-(define (new-scope-id!)
-  (set! id-counter (add1 id-counter))
-  id-counter)
-  
-(define (make-bindings)
-  (make-hasheq))
+(struct bind (sym        
+              binding)  ; either module-binding? or local-binding?
+  #:transparent)
 
-(define (new-scope)
-  (scope (new-scope-id!) (make-bindings)))
+;; branch is mutable for definition contexts
+(struct branch (id       ; unique id for this binding context
+                [binds #:mutable])  ; list of bindings
+  #:transparent)
 
-(define (new-multi-scope [name (gensym)])
-  (shifted-multi-scope 0 (multi-scope (make-hasheqv))))
 
-(define (multi-scope-to-scope-at-phase ms phase)
-  ;; Get the identity of `ms` at phase`
-  (or (hash-ref (multi-scope-scopes ms) phase #f)
-      (let ([s (representative-scope (new-scope-id!) (make-bindings) ms phase)])
-        (hash-set! (multi-scope-scopes ms) phase s)
-        s)))
+;; syntax s1 could bind s1 if they have the same marks and marks-pre
+(define (could-bind? s1 s2)
+  (and (equal? (syntax-marks s1) (syntax-marks s2))
+       (equal? (syntax-marks-pre s1) (syntax-marks-pre s2))))
 
-(define (scope>? sc1 sc2)
-  ((scope-id sc1) . > . (scope-id sc2)))
 
-;; FIXME: Adding, removing, or flipping a scope currently recurs
-;; through a syntax object eagerly, but it should be lazy
-(define (adjust-scope s sc op)
-  (cond
-   [(syntax? s) (struct-copy syntax s
-                             [e (adjust-scope (syntax-e s) sc op)]
-                             [scopes
-                              (if (shifted-multi-scope? sc)
-                                  (syntax-scopes s)
-                                  (op (syntax-scopes s) sc))]
-                             [shifted-multi-scopes
-                              (if (shifted-multi-scope? sc)
-                                  (op (syntax-shifted-multi-scopes s) sc)
-                                  (syntax-shifted-multi-scopes s))])]
-   [(pair? s) (cons (adjust-scope (car s) sc op)
-                    (adjust-scope (cdr s) sc op))]
-   [else s]))
-
-;; When a representative-scope is manipulated, we want to
-;; manipulate the multi scope, instead (at a particular
-;; phase shift)
-(define (generalize-scope sc)
-  (if (representative-scope? sc)
-      (shifted-multi-scope (representative-scope-phase sc)
-                           (representative-scope-owner sc))
-      sc))
-
-(define (add-scope s sc)
-  (adjust-scope s (generalize-scope sc) set-add))
-
-(define (add-scopes s scs)
-  (for/fold ([s s]) ([sc (in-list scs)])
-    (add-scope s sc)))
-
-(define (remove-scope s sc)
-  (adjust-scope s (generalize-scope sc) set-remove))
-
-(define (remove-scopes s scs)
-  (for/fold ([s s]) ([sc (in-list scs)])
-    (remove-scope s sc)))
-
-(define (set-flip s e)
-  (if (set-member? s e)
-      (set-remove s e)
-      (set-add s e)))
-
-(define (flip-scope s sc)
-  (adjust-scope s (generalize-scope sc) set-flip))
-
-;; To shift a syntax's phase, we only have to shift the phase
-;; of any phase-specific scopes. The bindings attached to a
-;; scope must be represented in such a s way that the binding
-;; shift is implicit via the phase in which the binding
-;; is resolved.
-(define (shift-multi-scope sms delta)
-  (if (zero? delta)
-      sms
-      (shifted-multi-scope (phase+ delta (shifted-multi-scope-phase sms))
-                           (shifted-multi-scope-multi-scope sms))))
-
-;; FIXME: this should be lazy, too
-(define (syntax-shift-phase-level s phase)
-  (if (eqv? phase 0)
-      s
-      (let loop ([s s])
-        (cond
-         [(syntax? s) (struct-copy syntax s
-                                   [e (loop (syntax-e s))]
-                                   [shifted-multi-scopes
-                                    (for/set ([sms (in-set (syntax-shifted-multi-scopes s))])
-                                      (shift-multi-scope sms phase))])]
-         [(pair? s) (cons (loop (car s))
-                          (loop (cdr s)))]
-         [else s]))))
-
-;; ----------------------------------------
-
-;; Assemble the complete set of scopes at a given phase by extracting
-;; a phase-specific representative from each multi-scope.
-(define (syntax-scope-set s phase)
-  (for/fold ([scopes (syntax-scopes s)]) ([sms (in-set (syntax-shifted-multi-scopes s))])
-    (set-add scopes (multi-scope-to-scope-at-phase (shifted-multi-scope-multi-scope sms)
-                                                   (phase- (shifted-multi-scope-phase sms)
-                                                           phase)))))
-
-(define (add-binding-in-scopes! scopes sym binding)
-  (when (set-empty? scopes)
-    (error "cannot bind in empty scope set"))
-  (define max-sc (for/fold ([max-sc (set-first scopes)]) ([sc (in-set scopes)])
-                   (if (scope>? sc max-sc)
-                       sc
-                       max-sc)))
-  (define bindings (scope-bindings max-sc))
-  (define sym-bindings (or (hash-ref bindings sym #f)
-                           (let ([h (make-hash)])
-                             (hash-set! bindings sym h)
-                             h)))
-  (hash-set! sym-bindings scopes binding))
-
-(define (add-binding! id binding phase)
-  (add-binding-in-scopes! (syntax-scope-set id phase) (syntax-e id) binding))
-
-(define (resolve s phase #:exactly? [exactly? #f])
-  (unless (identifier? s)
-    (raise-argument-error 'resolve "identifier?" s))
-  (unless (phase? phase)
-    (raise-argument-error 'resolve "phase?" phase))
-  (define scopes (syntax-scope-set s phase))
-  (define candidates (find-all-matching-bindings s scopes))
-  (cond
-   [(pair? candidates)
-    (define max-candidate
-      (argmax (lambda (c) (set-count (car c)))
-              candidates))
-    (check-unambiguous max-candidate candidates s scopes)
-    (and (or (not exactly?)
-             (equal? (set-count scopes)
-                     (set-count (car max-candidate))))
-         (cdr max-candidate))]
-   [else #f]))
-
-;; Returns a list of `(cons scope-set binding)`
-(define (find-all-matching-bindings s scopes)
-  (define sym (syntax-e s))
-  (for*/list ([sc (in-set scopes)]
-              [bindings (in-value (hash-ref (scope-bindings sc) sym #f))]
-              #:when bindings
-              [(b-scopes binding) (in-hash bindings)]
-              #:when (subset? b-scopes scopes))
-    (cons b-scopes binding)))
-
-(define (check-unambiguous max-candidate candidates s scopes)
-  (for ([c (in-list candidates)])
-    (unless (subset? (car c) (car max-candidate))
-      (error "ambiguous:" s scopes))))
-
-;; ----------------------------------------
-
+;; a will bind b if they have the same symbol, marks, and marks-pre
+;; binding is reflexive
 (define (bound-identifier=? a b phase)
-  (and (eq? (syntax-e a)
-            (syntax-e b))
-       (equal? (syntax-scope-set a phase)
-               (syntax-scope-set b phase))))
+  (and (equal? (syntax-e a) (syntax-e b))
+       (could-bind? a b)))
+
+
+(define (syntax-map s f)
+  (let loop ((s s))
+    (cond
+      [(syntax? s)
+       (f (struct-copy syntax s [e (loop (syntax-e s))]))]
+      [(list? s) (map loop s)]
+      [(pair? s) (cons (loop (car s))
+                       (loop (cdr s)))]
+      [else s])))
+
+
+(define (introduce s new-branches new-prephase-branchids [err-if-exists? #t])
+  (syntax-map s
+    (lambda (s)
+      (when (and err-if-exists? (not (hash-empty? (syntax-branches s))))
+        (error "already have branches" s))
+      (struct-copy syntax s
+                   [branches (hash-copy new-branches)]
+                   [prephase-branchids (map values new-prephase-branchids)]))))
+
+
+(define (extend-branch s branchid phase)
+  ;(printf "extend-branch ~a ~a on ~v\n\n" phase branchid s)
+  (syntax-map s
+    (lambda (s)
+      (cond
+        [(equal? 'all phase)
+         ; on module require, we need a new branch for all phases
+         ; but not all phases are realized
+         (define newbranches (make-hash))
+         (for ([(p b) (in-hash (syntax-branches s))])
+           (hash-set! newbranches p (cons (branch branchid null) b)))
+         (struct-copy syntax s
+                   [branches newbranches]
+                   [prephase-branchids (cons branchid (syntax-prephase-branchids s))])]
+        [else
+         (define bh (hash-ref (syntax-branches s) phase #f))
+         (when (not bh)
+           (set! bh (map (lambda (id) (branch id null)) (syntax-prephase-branchids s))))
+         (define newbranches (hash-copy (syntax-branches s)))
+         (hash-set! newbranches phase (cons (branch branchid '()) bh))
+         ;(when (identifier? s)
+         ;  (printf "~a adding ~a branch ~a\n" phase (syntax-e s) id))
+         (struct-copy syntax s
+                      [branches newbranches])]))))
+      
+
+;; For all syntax s, if (could-bind? id s)
+;; then we are binding it, which means add a bind to the list of binds
+;; in the branch identified by branchid
+(define (add-binding! s id binding branchid phase)
+  ;(printf "add-binding! id ~v binding ~v to ~v\n\n" (syntax-marks id) binding s)
+  (let loop ((s s))
+    ;(printf "  add-binding ~v\n" s)
+    (cond
+      [(syntax? s)
+       ;(printf "  add-binding syntax ~v\n" s)
+       ;(printf "  add-binding syntax marks ~v\n" (syntax-marks s))
+       (when (could-bind? id s)
+         (define b
+           (let loop ((br (hash-ref (syntax-branches s) phase #f)))
+             (cond
+               [(not br)
+                ; this syntax doesn't have a branch in this phase (literals, parenthesis)
+                ; try realizing this phase first
+                (define bh (map (lambda (id) (branch id null)) (syntax-prephase-branchids s)))
+                (hash-set! (syntax-branches s) phase bh)
+                (loop bh)]
+               [(null? br)  ; hit the end
+                ;(printf "couldn't find branch ~a in phase ~a for ~v\n\n" branchid phase s)
+                #f]
+               [(equal? branchid (branch-id (car br)))
+                (car br)]  ; found it
+               [else
+                (loop (cdr br))])))
+         (when b
+           #;(when (identifier? s)
+             (printf "~a add-binding! ~a bind ~a in ~a\n"
+                     phase (syntax-e s) (syntax-e id) branchid))
+           (set-branch-binds! b (cons (bind (syntax-e id) binding) (branch-binds b)))))
+       (loop (syntax-e s))]
+      [(list? s) (for-each loop s)]
+      [(pair? s) (begin (loop (car s))
+                        (loop (cdr s)))]
+      [else s])))
+
+
+(define (resolve id phase (err? #t))
+  (let loop ((b (if err?
+                    (hash-ref (syntax-branches id) phase
+                              (lambda () (error 'resolve "no branch for phase ~a in ~v" phase id)))
+                    (hash-ref (syntax-branches id) phase null))))
+    (cond
+      [(null? b)  ; ran out of branches
+       (if err?
+           (error "unbound identifier in phase:" phase id)
+           #f)]
+      [else
+       (define bind (findf (lambda (bind) (equal? (syntax-e id) (bind-sym bind)))
+                           (branch-binds (car b))))
+       (if bind
+           (bind-binding bind)
+           (loop (cdr b)))])))
+
+
+;; ------------------------------------------
+
+;; set a mark m on all syntax going into a macro
+(define (mark-pre s m)
+  (syntax-map s
+    (lambda (s)
+      (struct-copy syntax s
+                   [marks-pre (cons m (syntax-marks-pre s))]))))
+
+;; for syntax coming out of a macro
+;; if marks-pre has m, remove it (syntax was argument to macro)
+;; if not, add it to marks (syntax was introduced)
+(define (mark-post s m)
+  (syntax-map s
+    (lambda (s)
+      (define gotm? (and (not (null? (syntax-marks-pre s)))
+                         (equal? m (car (syntax-marks-pre s)))))
+      (struct-copy syntax s
+                   [marks-pre (if gotm?
+                                  (cdr (syntax-marks-pre s))
+                                  (syntax-marks-pre s))]
+                   [marks (if gotm?
+                              (syntax-marks s)
+                              (cons m (syntax-marks s)))]))))

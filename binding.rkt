@@ -9,7 +9,7 @@
  (struct-out module-binding)
  (struct-out local-binding)
  free-identifier=?
- add-local-binding!
+ core-literal
  
  empty-env
  env-extend
@@ -37,9 +37,18 @@
 ;; the binding was local.
 (struct local-binding (key))
 
+;; helper to create an identifier that always refers to the core form/prim
+(define (core-literal sym phase)
+  (define b (module-binding '#%core 0 sym
+                            '#%core 0 sym
+                            0))
+  (define s (extend-branch (datum->syntax #f sym) 'core-literal phase))
+  (add-binding! s s b 'core-literal phase)
+  s)
+
 (define (free-identifier=? a b phase)
-  (define ab (resolve a phase))
-  (define bb (resolve b phase))
+  (define ab (resolve a phase #f))
+  (define bb (resolve b phase #f))
   (cond
    [(module-binding? ab)
     (and (module-binding? bb)
@@ -57,12 +66,6 @@
     (and (not ab)
          (not bb)
          (eq? (syntax-e a) (syntax-e b)))]))
-
-;; Helper for registering a local binding in a set of scopes:
-(define (add-local-binding! id phase)
-  (define key (gensym (syntax-e id)))
-  (add-binding! id (local-binding key) phase)
-  key)
 
 ;; ----------------------------------------
 

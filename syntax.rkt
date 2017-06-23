@@ -11,53 +11,54 @@
  syntax-property)
 
 (struct syntax (e      ; datum and nested syntax objects
-                scopes ; scopes that apply at all phases
-                shifted-multi-scopes ; scopes with a distinct identity at each phase
+                marks  ; stack of unique ids used to distinguish macro-introduced syntax
+                marks-pre  ; stack of macro ids we haven't come out of yet
+                branches  ; mutable hash of branch lists, one for each phase
+                prephase-branchids  ; list of branch ids for unrealized phases (module imports)
                 srcloc ; source location
                 props) ; properties
         ;; Custom printer:
         #:property prop:custom-write
         (lambda (s port mode)
           (write-string "#<syntax:" port)
-          (fprintf port "~.s" (syntax->datum s))
-          (write-string ">" port)))
+          (fprintf port "~s" (syntax->datum s))
+          (write-string ">" port))
+  #:transparent)
 
-(define empty-scopes (seteq))
-(define empty-shifted-multi-scopes (set))
+(define empty-marks null)
+(define empty-branches (make-hash))
 (define empty-props #hash())
 
-(define empty-syntax
-  (syntax #f empty-scopes empty-shifted-multi-scopes #f empty-props))
+(define (empty-syntax)
+  (syntax #f empty-marks empty-marks empty-branches null #f empty-props))
 
 (define (identifier? s)
   (and (syntax? s) (symbol? (syntax-e s))))
 
 (define (syntax->datum s)
-  (let loop ([s (syntax-e s)])
+  (let loop ([s/e (syntax-e s)])
     (cond
-     [(syntax? s) (loop (syntax-e s))]
-     [(pair? s) (cons (loop (car s))
-                      (loop (cdr s)))]
-     [else s])))
+     [(syntax? s/e) (loop (syntax-e s/e))]
+     [(pair? s/e) (cons (loop (car s/e))
+                        (loop (cdr s/e)))]
+     [else s/e])))
 
-(define (datum->syntax stx-c s [stx-l #f] [stx-p #f])
+(define (datum->syntax stx-c v [stx-l #f] [stx-p #f])
   (define (wrap e)
     (syntax e
-            (if stx-c
-                (syntax-scopes stx-c)
-                empty-scopes)
-            (if stx-c
-                (syntax-shifted-multi-scopes stx-c)
-                empty-shifted-multi-scopes)
+            (if stx-c (syntax-marks stx-c) empty-marks)
+            (if stx-c (syntax-marks-pre stx-c) empty-marks)
+            (if stx-c (hash-copy (syntax-branches stx-c)) empty-branches)
+            (if stx-c (syntax-prephase-branchids stx-c) null)
             (and stx-l (syntax-srcloc stx-l))
             (if stx-p (syntax-props stx-p) empty-props)))
   (cond
-   [(syntax? s) s]
-   [(list? s) (wrap (for/list ([e (in-list s)])
-                      (datum->syntax stx-c e stx-l stx-p)))]
-   [(pair? s) (wrap (cons (datum->syntax stx-c (car s) stx-l stx-p)
-                          (datum->syntax stx-c (cdr s) stx-l stx-p)))]
-   [else (wrap s)]))
+   [(syntax? v) v]
+   [(list? v) (wrap (for/list ([elem-v (in-list v)])
+                      (datum->syntax stx-c elem-v stx-l stx-p)))]
+   [(pair? v) (wrap (cons (datum->syntax stx-c (car v) stx-l stx-p)
+                          (datum->syntax stx-c (cdr v) stx-l stx-p)))]
+   [else (wrap v)]))
 
 (define syntax-property
   (case-lambda

@@ -55,7 +55,7 @@
                 (module-binding-nominal-module binding)
                 (lambda (at-mod)
                   (hash-update at-mod
-                               (module-binding-nominal-require-phase binding)
+                               phase
                                (lambda (l) (cons (required id phase can-shadow?) l))
                                null))
                 #hasheqv()))
@@ -63,14 +63,14 @@
 ;; Check whether an identifier has a binding that is from a non-shadowable
 ;; require
 (define (check-not-required-or-defined r+p id phase)
-  (define b (resolve id phase #:exactly? #t))
+  (define b (resolve id phase #f))
   (when b
     (define at-mod (hash-ref (requires+provides-requires r+p)
                              (module-binding-nominal-module b)
                              #f))
     (and at-mod
          (for ([r (in-list (hash-ref at-mod
-                                     (module-binding-nominal-require-phase b)
+                                     phase
                                      null))])
            (when (and (eq? (syntax-e id) (syntax-e (required-id r)))
                       (not (required-can-shadow? r)))

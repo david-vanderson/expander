@@ -19,7 +19,8 @@
 
 (define layers '(raw raw/no-just-meta phaseless path))
 
-(define (parse-and-perform-requires! reqs self m-ns phase-shift
+(define (parse-and-perform-requires! reqs branchid bodys
+                                     self m-ns phase-shift
                                      requires+provides
                                      #:run? [run? #f])
   (let loop ([reqs reqs]
@@ -137,7 +138,8 @@
          (unless (module-path? mp)
            (error "bad require spec:" req))
          (perform-require! mp self
-                           (or req top-req) m-ns phase-shift just-meta adjust
+                           (or req top-req) branchid bodys
+                           m-ns phase-shift just-meta adjust
                            requires+provides
                            #:run? run?)]))))
 
@@ -148,28 +150,28 @@
 ;; ----------------------------------------
 
 (define (perform-initial-require! mod-path self
-                                  in-stx m-ns
+                                  ctx-stx branchid bodys m-ns
                                   requires+provides)
   (perform-require! mod-path self
-                    in-stx m-ns 0 'all #f
+                    ctx-stx branchid bodys m-ns 0 'all #f
                     requires+provides
                     #:can-shadow? #t))
 
 ;; ----------------------------------------
 
 (define (perform-require! mod-path self
-                          in-stx m-ns phase-shift just-meta adjust
+                          ctx-stx branchid bodys m-ns phase-shift just-meta adjust
                           requires+provides
                           #:run? [run? #f]
                           #:can-shadow? [can-shadow? #f])
   (define module-name (resolve-module-path mod-path self))
-  (define bind-in-stx (if (adjust-rename? adjust)
-                          (adjust-rename-to-id adjust)
-                          in-stx))
+  (define bind-ctx (if (adjust-rename? adjust)
+                       (adjust-rename-to-id adjust)
+                       ctx-stx))
   (define done-syms (make-hash))
   (add-required-module! requires+provides module-name phase-shift)
   (bind-all-provides!
-   bind-in-stx phase-shift m-ns module-name
+   bind-ctx branchid bodys phase-shift m-ns module-name
    #:filter (lambda (binding)
               (define sym (module-binding-nominal-sym binding))
               (define provide-phase (module-binding-nominal-phase binding))
@@ -196,8 +198,9 @@
                        (hash-set! done-syms sym #t)
                        (adjust-rename-to-id adjust))]))
               (when adjusted-sym
-                (define s (datum->syntax bind-in-stx adjusted-sym))
+                (define s (datum->syntax bind-ctx adjusted-sym))
                 (define bind-phase (phase+ phase-shift provide-phase))
+                (add-binding! s s binding branchid bind-phase)
                 (check-not-required-or-defined requires+provides
                                                s bind-phase)
                 (add-defined-or-required-id! requires+provides
@@ -224,7 +227,7 @@
 
 ;; ----------------------------------------
 
-(define (bind-all-provides! in-stx phase-shift ns module-name
+(define (bind-all-provides! bind-ctx branchid bodys phase-shift ns module-name
                             #:filter filter)
   (define m (namespace->module ns module-name))
   (unless m
@@ -244,4 +247,4 @@
                              [nominal-require-phase phase-shift]))
       (let-values ([(sym) (filter b)])
         (when sym
-          (add-binding! (datum->syntax in-stx sym) b phase))))))
+          (add-binding! bodys (datum->syntax bind-ctx sym) b branchid phase))))))

@@ -14,25 +14,34 @@
 
 ;; Common expansion for `lambda` and `case-lambda`
 (define (make-lambda-expander s formals bodys ctx)
-  (define sc (new-scope))
   (define phase (expand-context-phase ctx))
   ;; Parse and check formal arguments:
-  (define ids (parse-and-flatten-formals formals sc))
+  (define ids (parse-and-flatten-formals formals))
   (check-no-duplicate-ids ids phase s)
-  ;; Bind each argument and generate a corresponding key for the
-  ;; expand-time environment:
-  (define keys (for/list ([id (in-list ids)])
-                 (add-local-binding! id phase)))
-  (define body-env (for*/fold ([env (expand-context-env ctx)]) ([key (in-list keys)])
-                     (env-extend env key variable)))
+
+  ;; Create the branch for this binding context
+  (define branchid (gensym 'lambda))
+  (set! ids (extend-branch ids branchid phase))
+  (set! bodys (extend-branch bodys branchid phase))
+
+  (define body-env
+    (for/fold ([env (expand-context-env ctx)])
+              ([id (in-list ids)])
+      (define key (gensym (syntax-e id)))
+      ;; make a binding and add it to all syntax
+      (define b (local-binding key))
+      (add-binding! ids id b branchid phase)
+      (add-binding! bodys id b branchid phase)
+      ;; extend the environment
+      (env-extend env key variable)))
+  
   ;; Expand the function body:
   (define body-ctx (struct-copy expand-context ctx
-                                [env body-env]
-                                [scopes (cons sc (expand-context-scopes ctx))]))
-  (define exp-body (expand-body bodys sc s body-ctx))
-  ;; Return formals (with new scope) and expanded body:
-  (values (add-scope formals sc)
-          exp-body))
+                                [env body-env]))
+  (define exp-body (expand-body bodys s body-ctx))
+  
+  ;; Return formals (with new bindings) and expanded body:
+  (values ids exp-body))
 
 (add-core-form!
  'lambda
@@ -59,10 +68,10 @@
             (make-lambda-expander s formals bodys ctx))
           (rebuild clause `[,exp-formals ,exp-body]))))))
 
-(define (parse-and-flatten-formals all-formals sc)
+(define (parse-and-flatten-formals all-formals)
   (let loop ([formals all-formals])
     (cond
-     [(identifier? formals) (list (add-scope formals sc))]
+     [(identifier? formals) (list formals)]
      [(syntax? formals)
       (define p (syntax-e formals))
       (cond
@@ -72,7 +81,7 @@
      [(pair? formals)
       (unless (identifier? (car formals))
         (error "not an identifier:" (car formals)))
-      (cons (add-scope (car formals) sc)
+      (cons (car formals)
             (loop (cdr formals)))]
      [(null? formals)
       null]
@@ -82,7 +91,7 @@
 ;; ----------------------------------------
 
 ;; Common expansion for `let[rec]-[syntaxes+]values`
-(define (make-let-values-form syntaxes? rec?)
+(define (make-let-values-form letsym syntaxes? rec?)
   (lambda (s ctx)
     (define m (if syntaxes?
                   (match-syntax s '(letrec-syntaxes+values
@@ -91,66 +100,110 @@
                                     body ...+))
                   (match-syntax s '(let-values ([(val-id ...) val-rhs] ...)
                                     body ...+))))
-   (define sc (new-scope))
-   (define phase (expand-context-phase ctx))
-   ;; Add the new scope to each binding identifier:
-   (define trans-idss (for/list ([ids (in-list (if syntaxes? (m 'trans-id) null))])
-                        (for/list ([id (in-list ids)])
-                          (add-scope id sc))))
-   (define val-idss (for/list ([ids (in-list (m 'val-id))])
-                      (for/list ([id (in-list ids)])
-                        (add-scope id sc))))
-   (check-no-duplicate-ids (list trans-idss val-idss) phase s)
-   ;; Bind each left-hand identifier and generate a corresponding key
-   ;; fo the expand-time environment:
-   (define trans-keyss (for/list ([ids (in-list trans-idss)])
-                         (for/list ([id (in-list ids)])
-                           (add-local-binding! id phase))))
-   (define val-keyss (for/list ([ids (in-list val-idss)])
-                       (for/list ([id (in-list ids)])
-                         (add-local-binding! id phase))))
-   ;; Evaluate compile-time expressions (if any):
-   (define trans-valss (for/list ([rhs (in-list (if syntaxes? (m 'trans-rhs) null))]
-                                  [ids (in-list trans-idss)])
-                         (eval-for-syntaxes-binding (add-scope rhs sc) ids ctx)))
-   ;; Fill expansion-time environment:
-   (define rec-val-env
-     (for*/fold ([env (expand-context-env ctx)]) ([keys (in-list val-keyss)]
-                                                  [key (in-list keys)])
-       (env-extend env key variable)))
-   (define rec-env (for/fold ([env rec-val-env]) ([keys (in-list trans-keyss)]
-                                                  [vals (in-list trans-valss)])
-                     (for/fold ([env env]) ([key (in-list keys)]
-                                            [val (in-list vals)])
-                       (env-extend env key val))))
-   ;; Expand right-hand sides and bodyL
-   (define rec-ctx (struct-copy expand-context ctx
-                                [env rec-env]
-                                [scopes (cons sc (expand-context-scopes ctx))]))
-   (define letrec-values-id
-     (if syntaxes?
-         (datum->syntax (syntax-shift-phase-level core-stx phase) 'letrec-values)
-         (m 'let-values)))
-   (rebuild
-    s
-    `(,letrec-values-id ,(for/list ([ids (in-list val-idss)]
-                                    [rhs (in-list (m 'val-rhs))])
-                           `[,ids ,(if rec?
-                                       (expand (add-scope rhs sc) rec-ctx)
-                                       (expand rhs ctx))])
-      ,(expand-body (m 'body) sc s rec-ctx)))))
+
+    (define phase (expand-context-phase ctx))
+    (define transids (if syntaxes? (m 'trans-id) null))
+    (define transs (if syntaxes? (m 'trans-rhs) null))
+    (define valids (m 'val-id))
+    (define valrhs (m 'val-rhs))
+    (define bodys (m 'body))
+
+    (check-no-duplicate-ids (list transids valids) phase s)
+
+    (when (not rec?)
+      ;; expand+eval transformer rhs before binding
+      (set! transs
+            (for/list ([ids (in-list transids)]
+                       [rhs (in-list transs)])
+              (eval-for-syntaxes-binding rhs ids ctx)))
+      
+      ; expand value rhs before binding
+      (set! valrhs
+            (for/list ([rhs (in-list valrhs)])
+              (expand rhs ctx))))
+
+    ;; helper
+    (define (update-syntax! f)
+      (set! transids (f transids))
+      (when rec? (set! transs (f transs)))
+      (set! valids (f valids))
+      (when rec? (set! valrhs (f valrhs)))
+      (set! bodys (f bodys)))
+
+    ;; Create the binding branch for this context
+    (define branchid (gensym letsym))
+    (update-syntax! (lambda (s) (extend-branch s branchid phase)))
+
+    ;; Bind each trans id
+    (define trans-keyss
+      (for/list ([ids (in-list transids)])
+        (for/list ([id (in-list ids)])
+          (define key (gensym (syntax-e id)))
+          ;; make a binding and add it to all syntax
+          (define b (local-binding key))
+          (update-syntax! (lambda (s) (add-binding! s id b branchid phase) s))
+          key)))
+
+    ;; Bind each val id
+    (define val-keyss
+      (for/list ([ids (in-list valids)])
+        (for/list ([id (in-list ids)])
+          (define key (gensym (syntax-e id)))
+          ;; make a binding and add it to all syntax
+          (define b (local-binding key))
+          (update-syntax! (lambda (s) (add-binding! s id b branchid phase) s))
+          key)))
+
+    (when rec?
+      ;; expand+eval transformer rhs after binding
+      (set! transs
+            (for/list ([ids (in-list transids)]
+                       [rhs (in-list transs)])
+              (eval-for-syntaxes-binding rhs ids ctx))))
+
+    ;; Extend environment
+    (define rec-val-env
+      (for*/fold ([env (expand-context-env ctx)]) ([keys (in-list val-keyss)]
+                                                   [key (in-list keys)])
+        (env-extend env key variable)))
+    (define rec-env (for/fold ([env rec-val-env]) ([keys (in-list trans-keyss)]
+                                                   [vals (in-list transs)])
+                      (for/fold ([env env]) ([key (in-list keys)]
+                                             [val (in-list vals)])
+                        (env-extend env key val))))
+
+    (define rec-ctx (struct-copy expand-context ctx
+                                 [env rec-env]))
+
+    (when rec?
+      ; expand value rhs in presence of bindings and extended environment
+      (set! valrhs
+            (for/list ([rhs (in-list valrhs)])
+              (expand rhs rec-ctx))))
+
+    ; Expand body
+    (define exp-body (expand-body bodys s rec-ctx))
+
+    ; create new syntax using let[rec]-values
+    (rebuild
+     s
+     `(,(core-literal (if rec? 'letrec-values 'let-values) phase)
+       ,(for/list ([ids (in-list valids)]
+                   [rhs (in-list valrhs)])
+          `[,ids ,rhs])
+       ,exp-body))))
 
 (add-core-form!
  'let-values
- (make-let-values-form #f #f))
+ (make-let-values-form 'let-values #f #f))
 
 (add-core-form!
  'letrec-values
- (make-let-values-form #f #t))
+ (make-let-values-form 'letrec-values #f #t))
 
 (add-core-form!
  'letrec-syntaxes+values
- (make-let-values-form #t #t))
+ (make-let-values-form 'letrec-syntaxes+values #t #t))
 
 ;; ----------------------------------------
 
@@ -160,10 +213,9 @@
    (define m (match-syntax s '(#%datum . datum)))
    (when (keyword? (syntax-e (m 'datum)))
      (error "keyword misused as an expression:" (m 'datum)))
-   (define phase (expand-context-phase ctx))
    (rebuild
     s
-    (list (datum->syntax (syntax-shift-phase-level core-stx phase) 'quote)
+    (list (core-literal 'quote (expand-context-phase ctx))
           (m 'datum)))))
 
 (add-core-form!
@@ -186,17 +238,11 @@
 (add-core-form!
  'quote-syntax
  (lambda (s ctx)
-   (define m-local (try-match-syntax s '(quote-syntax datum #:local)))
-   (define m (or m-local
-                 (match-syntax s '(quote-syntax datum))))
+   (define m (match-syntax s '(quote-syntax datum)))
    (rebuild
     s
     `(,(m 'quote-syntax)
-      ,(if m-local
-           ;; #:local means don't prune:
-           (m 'datum)
-           ;; otherwise, prune scopes up to transformer boundary:
-           (remove-scopes (m 'datum) (expand-context-scopes ctx)))))))
+      ,(m 'datum)))))
 
 (add-core-form!
  'if

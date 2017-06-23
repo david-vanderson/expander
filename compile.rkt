@@ -12,7 +12,25 @@
 (provide compile
          compile-module
          expand-time-eval
-         run-time-eval)
+         run-time-eval
+         syntax-shift-phase-level)
+
+(define (syntax-shift-phase-level s phase)
+  (if (eqv? phase 0)
+      s
+      (let loop ([s s])
+        (cond
+          [(syntax? s)
+           (define newbranches (make-hash))
+           (for ([(p b) (in-hash (syntax-branches s))])
+             (hash-set! newbranches (phase+ p phase) b))
+           (struct-copy syntax s
+                        [e (loop (syntax-e s))]
+                        [branches newbranches])]
+          [(pair? s) (cons (loop (car s))
+                           (loop (cdr s)))]
+          [else s]))))
+
 
 (define phase-shift-id (gensym 'phase))
 (define ns-id (gensym 'namespace))
@@ -146,7 +164,6 @@
 (define (compile-let core-sym s phase ns self-name)
   (define rec? (eq? core-sym 'letrec-values))
   (define m (match-syntax s '(let-values ([(id ...) rhs] ...) body)))
-  (define sc (new-scope))
   (define idss (m 'id))
   (define symss (for/list ([ids (in-list idss)])
                   (for/list ([id (in-list ids)])

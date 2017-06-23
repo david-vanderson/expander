@@ -19,7 +19,6 @@
          eval-for-syntaxes-binding
          eval-for-bindings
          
-         remove-use-site-scopes
          rebuild)
 
 ;; ----------------------------------------
@@ -113,42 +112,18 @@
 ;; Given a macro transformer `t`, apply it --- adding appropriate
 ;; scopes to represent the expansion step
 (define (apply-transformer t s ctx)
-  (define intro-scope (new-scope))
-  (define intro-s (add-scope s intro-scope))
-  ;; In a definition context, we need use-site scopes
-  (define use-s (maybe-add-use-site-scope intro-s ctx))
+  ;; Mark given syntax
+  (define m (gensym 't))
+  (define marked-s (mark-pre s m))
   ;; Call the transformer; the current expansion context may be needed
   ;; for `{free,bound}-identifier=?`
   (define transformed-s (parameterize ([current-expand-context ctx])
-                          (t use-s)))
+                          (t marked-s)))
   (unless (syntax? transformed-s)
     (error "transformer produced non-syntax:" transformed-s))
-  (define result-s (flip-scope transformed-s intro-scope))
-  ;; In a definition contex, we need to add the inside-edge scope to
-  ;; any expansion result
-  (maybe-add-post-expansion-scope result-s ctx))
+  (define after-s (mark-post transformed-s m))
+  after-s)
 
-(define (maybe-add-use-site-scope s ctx)
-  (cond
-   [(expand-context-use-site-scopes ctx)
-    ;; We're in a recursive definition context where use-site scopes
-    ;; are needed, so create one, record it, and add to the given
-    ;; syntax
-    (define sc (new-scope))
-    (define b (expand-context-use-site-scopes ctx))
-    (set-box! b (cons sc (unbox b)))
-    (add-scope s sc)]
-   [else s]))
-
-(define (maybe-add-post-expansion-scope s ctx)
-  (cond
-   [(expand-context-post-expansion-scope ctx)
-    ;; We're in a definition context where an inside-edge scope needs
-    ;; to be added to any immediate macro expansion; that way, if the
-    ;; macro expands to a definition form, the binding will be in the
-    ;; definition context's scope
-    (add-scope s (expand-context-post-expansion-scope ctx))]
-   [else s]))
 
 ;; Helper to lookup a binding in an expansion context
 (define (lookup b ctx id)
@@ -161,29 +136,23 @@
 ;; ----------------------------------------
 
 ;; Expand a sequence of body forms in a definition context
-(define (expand-body bodys sc s ctx)
-  ;; The outside-edge scope identifies the original content of the
-  ;; definition context
-  (define outside-sc (new-scope))
-  ;; The inside-edge scope identifiers any form that appears (perhaps
-  ;; through macro expansion) in the definition context
-  (define inside-sc (new-scope))
-  (define init-bodys
-    (for/list ([body (in-list bodys)])
-      (add-scope (add-scope (add-scope body sc) outside-sc) inside-sc)))
-  (define phase (expand-context-phase ctx))
+(define (expand-body bodys s ctx)
   ;; Create an expansion context for expanding only immediate macros;
   ;; this partial-expansion phase uncovers macro- and variable
   ;; definitions in the definition context
   (define body-ctx (struct-copy expand-context ctx
-                                [only-immediate? #t]
-                                [post-expansion-scope inside-sc]
-                                [scopes (list* outside-sc
-                                               inside-sc
-                                               (expand-context-scopes ctx))]
-                                [use-site-scopes (box null)]))
+                                [only-immediate? #t]))
+
+  ;; make a unique id for this definition context
+  (define defid (gensym 'def))
+  (define phase (expand-context-phase ctx))
+
+  ;; add branch for this context to all syntax as a place
+  ;; to insert bindings we find
+  (set! bodys (extend-branch bodys defid phase))
+
   (let loop ([body-ctx body-ctx]
-             [bodys init-bodys]
+             [bodys bodys]
              [done-bodys null] ; accumulated expressions
              [val-binds null]  ; accumulated bindings
              [dups (make-check-no-duplicate-table)])
@@ -194,6 +163,10 @@
       (finish-expanding-body body-ctx done-bodys val-binds s)]
      [else
       (define exp-body (expand (car bodys) body-ctx))
+      ;; because of the partial expand, exp-body will be:
+      ;; - a list where the first identifier is a core form
+      ;; - an identifier that is a variable, primitive, or core form
+      
       (case (core-form-sym exp-body phase)
         [(begin)
          ;; Splice a `begin` form
@@ -207,17 +180,25 @@
          ;; Found a variable definition; add bindings, extend the
          ;; environment, and continue
          (define m (match-syntax exp-body '(define-values (id ...) rhs)))
-         (define ids (remove-use-site-scopes (m 'id) body-ctx))
-         (define new-dups (check-no-duplicate-ids ids phase exp-body dups))
-         (define keys (for/list ([id (in-list ids)])
-                        (add-local-binding! id phase)))
-         (define extended-env (for/fold ([env (expand-context-env body-ctx)]) ([key (in-list keys)])
-                                (env-extend env key variable)))
+         (define new-dups (check-no-duplicate-ids (m 'id) phase exp-body dups))
+         (define extended-env
+           (for/fold ([env (expand-context-env body-ctx)])
+                     ([id (in-list (m 'id))])
+             (define key (gensym (syntax-e id)))
+             ;; make a binding and add it to all syntax
+             (define b (local-binding key))
+             (add-binding! exp-body id b defid phase)
+             (add-binding! (cdr bodys) id b defid phase)
+             (add-binding! done-bodys id b defid phase)
+             (add-binding! val-binds id b defid phase)
+             ;; extend the environment
+             (env-extend env key variable)))
+
          (loop (struct-copy expand-context body-ctx
                             [env extended-env])
                (cdr bodys)
                null
-               (cons (list ids (m 'rhs))
+               (cons (list (m 'id) (m 'rhs))
                      ;; If we had accumulated some expressions, we
                      ;; need to turn each into a
                      ;;  (defined-values () (begin <expr> (values)))
@@ -233,11 +214,18 @@
          ;; compile-time right-hand side, install the compile-time
          ;; values in the environment, and continue
          (define m (match-syntax exp-body '(define-syntaxes (id ...) rhs)))
-         (define ids (remove-use-site-scopes (m 'id) body-ctx))
-         (define new-dups (check-no-duplicate-ids ids phase exp-body dups))
-         (define keys (for/list ([id (in-list ids)])
-                        (add-local-binding! id phase)))
-         (define vals (eval-for-syntaxes-binding (m 'rhs) ids ctx))
+         (define new-dups (check-no-duplicate-ids (m 'id) phase exp-body dups))
+         (define keys
+           (for/list ([id (in-list (m 'id))])
+             (define key (gensym (syntax-e id)))
+             ;; make a binding and add it to all syntax
+             (define b (local-binding key))
+             (add-binding! exp-body id b defid phase)
+             (add-binding! (cdr bodys) id b defid phase)
+             (add-binding! done-bodys id b defid phase)
+             (add-binding! val-binds id b defid phase)
+             key))
+         (define vals (eval-for-syntaxes-binding (m 'rhs) (m 'id) ctx))
          (define extended-env (for/fold ([env (expand-context-env body-ctx)]) ([key (in-list keys)]
                                                                                [val (in-list vals)])
                                 (env-extend env key val)))
@@ -260,29 +248,22 @@
 (define (finish-expanding-body body-ctx done-bodys val-binds s)
   (when (null? done-bodys)
     (error "no body forms:" s))
-  ;; To reference core forms at the current expansion phase:
-  (define s-core-stx
-    (syntax-shift-phase-level core-stx (expand-context-phase body-ctx)))
+  
   ;; As we finish expanding, we're no longer in a definition context
   (define finish-ctx (struct-copy expand-context body-ctx
-                                  [use-site-scopes #f]
-                                  [scopes (append
-                                           (unbox (expand-context-use-site-scopes body-ctx))
-                                           (expand-context-scopes body-ctx))]
-                                  [only-immediate? #f]
-                                  [post-expansion-scope #f]))
+                                  [only-immediate? #f]))
   ;; Helper to expand and wrap the ending expressions in `begin`, if needed:
   (define (finish-bodys)
     (cond
      [(null? (cdr done-bodys))
       (expand (car done-bodys) finish-ctx)]
      [else
-      (datum->syntax
-       #f
-       `(,(datum->syntax s-core-stx 'begin)
+      (rebuild
+       s
+       `(,(core-literal 'begin (expand-context-phase finish-ctx))
          ,@(for/list ([body (in-list done-bodys)])
-             (expand body finish-ctx)))
-       s)]))
+             (expand body finish-ctx))))]))
+  
   (cond
    [(null? val-binds)
     ;; No definitions, so no `letrec-values` wrapper needed:
@@ -290,33 +271,22 @@
    [else
     ;; Add `letrec-values` wrapper, finish expanding the right-hand
     ;; sides, and then finish the body expression:
-    (datum->syntax
-     #f
-     `(,(datum->syntax s-core-stx 'letrec-values)
+    (rebuild
+     s
+     `(,(core-literal 'letrec-values (expand-context-phase finish-ctx))
        ,(for/list ([bind (in-list (reverse val-binds))])
           `(,(datum->syntax #f (car bind)) ,(expand (cadr bind) finish-ctx)))
-       ,(finish-bodys))
-     s)]))
+       ,(finish-bodys)))]))
 
 ;; Helper to turn an expression into a binding clause with zero
 ;; bindings
 (define (no-binds expr s phase)
-  (define s-core-stx (syntax-shift-phase-level core-stx phase))
   (list null (datum->syntax #f
-                            `(,(datum->syntax s-core-stx 'begin)
+                            `(,(core-literal 'begin phase)
                               ,expr
-                              (,(datum->syntax s-core-stx '#%app)
-                               ,(datum->syntax s-core-stx 'values)))
+                              (,(core-literal '#%app phase)
+                               ,(core-literal 'values phase)))
                             s)))
-
-;; Helper to remove any created use-site scopes from the left-hand
-;; side of a definition that was revealed by partial expansion in a
-;; definition context
-(define (remove-use-site-scopes s ctx)
-  (define use-sites (expand-context-use-site-scopes ctx))
-  (if use-sites
-      (remove-scopes s (unbox use-sites))
-      s))
 
 ;; ----------------------------------------
 
@@ -324,12 +294,9 @@
 ;; expansion context
 (define (expand-transformer s ctx)
   (expand s (struct-copy expand-context ctx
-                         [scopes null]
                          [phase (add1 (expand-context-phase ctx))]
                          [env empty-env]
-                         [only-immediate? #f]
-                         [post-expansion-scope #f]
-                         [module-scopes null])))
+                         [only-immediate? #f])))
 
 ;; Expand and evaluate `s` as a compile-time expression, ensuring that
 ;; the number of returned values matches the number of target
