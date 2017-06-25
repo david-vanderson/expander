@@ -75,6 +75,16 @@
     (let-values ([(z) 10])
       (begin z (if (m 10) 1 2))))))
 
+"macro introduces syntax into definition context"
+(eval-expression
+ #:check 'x-m
+ '(letrec-syntaxes+values
+    ([(m) (lambda (stx) (quote-syntax (begin (define-values (x) 'x-m) x)))])
+    ()
+    (let-values ([(x) 'x-3])
+      (m)
+      )))
+
 "expansion not captured"
 (eval-expression
  #:check 'x-1
