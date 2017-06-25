@@ -9,7 +9,7 @@
 
 
 (define (namespace-syntax-introduce s)
-  (introduce s 0 coreb))
+  (introduce s (coreb 0)))
  
 (define (expand s)
   (expand-in-context s (make-expand-context (current-namespace) coreb)))

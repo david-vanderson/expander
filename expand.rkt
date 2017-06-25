@@ -24,8 +24,7 @@
 (define (literal sym ctx)
   (define phase (expand-context-phase ctx))
   (introduce (datum->syntax #f sym)
-             phase
-             (expand-context-coreb ctx)))
+             ((expand-context-coreb ctx) phase)))
 
 ;; ----------------------------------------
 
@@ -105,14 +104,15 @@
 (define (apply-transformer t s)
   ;; Mark given syntax
   (define m (gensym 't))
-  (define marked-s (mark-pre s m))
+  (define marked-s (mark s m))
   ;; Call the transformer
   ;(printf "before t: ~v\n\n" marked-s)
   (define transformed-s (t marked-s))
   (unless (syntax? transformed-s)
     (error "transformer produced non-syntax:" transformed-s))
   ;(printf "after t: ~v\n\n" t-s)
-  (define after-s (mark-post transformed-s m))
+  ;; Swap marks
+  (define after-s (mark transformed-s m))
   ;(printf "after b: ~v\n\n" after-s)
   after-s)
 
@@ -126,8 +126,8 @@
   (define body-ctx (struct-copy expand-context ctx
                                 [only-immediate? #t]))
   (define defid (gensym 'def))
-
-  (set! bodys (extend-branch bodys defid (expand-context-phase ctx)))
+  (define newbranches (make-newbranches))
+  (set! bodys (extend-branch bodys defid newbranches))
 
   (let loop ([bodys bodys]
              [done-trans null]  ; accumulated expanded transformers
@@ -140,6 +140,10 @@
       (finish-expanding-body ctx done-bodys val-binds s)]
      [else
       (define exp-body (expand (car bodys) body-ctx))
+
+      ;; expand could have brought macro-introduced syntax into this definition context
+      (set! exp-body (extend-branch exp-body defid newbranches))
+      
       ;; because of the partial expand, exp-body will be:
       ;; a list where the first identifier is a core form
       ;; an identifier that is a variable, primitive, or core form
@@ -173,14 +177,10 @@
             (define m (match-syntax exp-body '(define-values (id ...) rhs)))
             (for ([id (in-list (m 'id))])
               (define sym (syntax-e id))
-              (define b (bind sym 'var (gensym sym)))
+              (define b (bind (expand-context-phase ctx) sym 'var (gensym sym)))
               ;; Add the new binding
               ;(printf "define-values binding ~a\n\n" sym)
-              (add-binding! (cdr bodys) id b defid (expand-context-phase ctx))
-              (add-binding! exp-body id b defid (expand-context-phase ctx))
-              (add-binding! done-trans id b defid (expand-context-phase ctx))
-              (add-binding! done-bodys id b defid (expand-context-phase ctx))
-              (add-binding! val-binds id b defid (expand-context-phase ctx)))
+              (add-binding! id b newbranches))
               
             (loop (cdr bodys)
                   done-trans
@@ -204,14 +204,10 @@
             (define m (match-syntax exp-body '(define-syntaxes (id ...) rhs)))
             (for ([id (in-list (m 'id))])
               (define sym (syntax-e id))
-              (define b (bind sym 'stx #f))
+              (define b (bind (expand-context-phase ctx) sym 'stx #f))
               ;; Add the new binding
               ;(printf "define-syntaxes binding ~a\n\n" sym)
-              (add-binding! (cdr bodys) id b defid (expand-context-phase ctx))
-              (add-binding! exp-body id b defid (expand-context-phase ctx))
-              (add-binding! done-trans id b defid (expand-context-phase ctx))
-              (add-binding! done-bodys id b defid (expand-context-phase ctx))
-              (add-binding! val-binds id b defid (expand-context-phase ctx)))
+              (add-binding! id b newbranches))
 
             ;(printf "define-syntaxes (m 'rhs) ~v\n\n" (m 'rhs))
             (define-values (exp-trans transformers)
@@ -287,7 +283,7 @@
 ;; expansion context
 (define (expand-transformer s ctx)
   (define phase (+ (expand-context-phase ctx) 1))
-  (define ss (introduce s phase (expand-context-coreb ctx)))
+  (define ss (introduce s ((expand-context-coreb ctx) phase)))
   ;(printf "expand-transformer ss ~v\n\n" ss)
   (define sss (expand ss
                       (struct-copy expand-context ctx

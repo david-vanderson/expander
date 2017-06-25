@@ -1,4 +1,6 @@
-#lang racket
+#lang racket/base
+
+(require racket/set)
 
 (provide
  (struct-out syntax) ; includes `syntax?` and `syntax-e`
@@ -12,9 +14,8 @@
  syntax-property)
 
 (struct syntax (e      ; datum and nested syntax objects
-                marks  ; stack of unique ids used to distinguish macro-introduced syntax
-                marks-pre  ; stack of macro ids we haven't come out of yet
-                branches  ; hash of branch lists, one for each phase
+                marks  ; set of unique ids used to distinguish macro-introduced syntax
+                branches  ; list of branches
                 srcloc ; source location
                 props) ; properties
         ;; Custom printer:
@@ -25,7 +26,8 @@
 ;          (write-string ">" port))
   #:transparent)
 
-(define empty-branches #hash())
+(define empty-marks (seteq))
+(define empty-branches null)
 (define empty-props #hash())
 
 (define (identifier? s)
@@ -42,8 +44,7 @@
 (define (datum->syntax stx-c v [stx-l #f] [stx-p #f])
   (define (wrap e)
     (syntax e
-            (if stx-c (syntax-marks stx-c) null)
-            (if stx-c (syntax-marks-pre stx-c) null)
+            (if stx-c (syntax-marks stx-c) empty-marks)
             (if stx-c (syntax-branches stx-c) empty-branches)
             (and stx-l (syntax-srcloc stx-l))
             (if stx-p (syntax-props stx-p) empty-props)))
