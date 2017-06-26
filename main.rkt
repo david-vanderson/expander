@@ -26,20 +26,16 @@
   ns)
 
 (define (namespace-require req ns)
-  (define branchid (gensym 'namespace-req))
-  (define s (empty-syntax))
-  (set! s (namespace-syntax-introduce s ns))
-  (set! s (extend-branch s branchid 'all))
+  (define s (namespace-syntax-introduce (datum->syntax #f 'namespace-require-temp) ns))
+  (define newbranches (make-newbranches))
+  (set! s (extend-branch s (gensym 'namespace-req) newbranches))
   (parse-and-perform-requires! #:run? #t
                                (list (datum->syntax #f req))
-                               branchid s
+                               newbranches
                                #f ns
                                0
                                (make-requires+provides))
-  (hash-clear! (namespace-branches ns))
-  (for ([(p b) (in-hash (syntax-branches s))])
-    (hash-set! (namespace-branches ns) p b))
-  (set-namespace-prephase-branchids! ns (syntax-prephase-branchids s)))
+  (set-namespace-branches! ns (syntax-branches s)))
 
 (define (expand s [ns (current-namespace)])
   (expand-in-context s (make-expand-context ns)))

@@ -12,24 +12,7 @@
 (provide compile
          compile-module
          expand-time-eval
-         run-time-eval
-         syntax-shift-phase-level)
-
-(define (syntax-shift-phase-level s phase)
-  (if (eqv? phase 0)
-      s
-      (let loop ([s s])
-        (cond
-          [(syntax? s)
-           (define newbranches (make-hash))
-           (for ([(p b) (in-hash (syntax-branches s))])
-             (hash-set! newbranches (phase+ p phase) b))
-           (struct-copy syntax s
-                        [e (loop (syntax-e s))]
-                        [branches newbranches])]
-          [(pair? s) (cons (loop (car s))
-                           (loop (cdr s)))]
-          [else s]))))
+         run-time-eval)
 
 
 (define phase-shift-id (gensym 'phase))

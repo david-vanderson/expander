@@ -1,9 +1,12 @@
-#lang racket
+#lang racket/base
+
+(require racket/set)
 
 (provide
  (struct-out syntax) ; includes `syntax?` and `syntax-e`
- empty-syntax
  identifier?
+
+ empty-branches
  
  syntax->datum
  datum->syntax
@@ -11,26 +14,21 @@
  syntax-property)
 
 (struct syntax (e      ; datum and nested syntax objects
-                marks  ; stack of unique ids used to distinguish macro-introduced syntax
-                marks-pre  ; stack of macro ids we haven't come out of yet
-                branches  ; mutable hash of branch lists, one for each phase
-                prephase-branchids  ; list of branch ids for unrealized phases (module imports)
+                marks  ; set of unique ids used to distinguish macro-introduced syntax
+                branches  ; list of branches and phase shifts
                 srcloc ; source location
                 props) ; properties
         ;; Custom printer:
         #:property prop:custom-write
         (lambda (s port mode)
           (write-string "#<syntax:" port)
-          (fprintf port "~s" (syntax->datum s))
+          (fprintf port "~.s" (syntax->datum s))
           (write-string ">" port))
   #:transparent)
 
-(define empty-marks null)
-(define empty-branches (make-hash))
+(define empty-marks (seteq))
+(define empty-branches null)
 (define empty-props #hash())
-
-(define (empty-syntax)
-  (syntax #f empty-marks empty-marks empty-branches null #f empty-props))
 
 (define (identifier? s)
   (and (syntax? s) (symbol? (syntax-e s))))
@@ -47,9 +45,7 @@
   (define (wrap e)
     (syntax e
             (if stx-c (syntax-marks stx-c) empty-marks)
-            (if stx-c (syntax-marks-pre stx-c) empty-marks)
-            (if stx-c (hash-copy (syntax-branches stx-c)) empty-branches)
-            (if stx-c (syntax-prephase-branchids stx-c) null)
+            (if stx-c (syntax-branches stx-c) empty-branches)
             (and stx-l (syntax-srcloc stx-l))
             (if stx-p (syntax-props stx-p) empty-props)))
   (cond

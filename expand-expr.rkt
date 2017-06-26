@@ -21,8 +21,9 @@
 
   ;; Create the branch for this binding context
   (define branchid (gensym 'lambda))
-  (set! ids (extend-branch ids branchid phase))
-  (set! bodys (extend-branch bodys branchid phase))
+  (define newbranches (make-newbranches))
+  (set! ids (extend-branch ids branchid newbranches))
+  (set! bodys (extend-branch bodys branchid newbranches))
 
   (define body-env
     (for/fold ([env (expand-context-env ctx)])
@@ -30,8 +31,7 @@
       (define key (gensym (syntax-e id)))
       ;; make a binding and add it to all syntax
       (define b (local-binding key))
-      (add-binding! ids id b branchid phase)
-      (add-binding! bodys id b branchid phase)
+      (add-binding! id (syntax-e id) phase b newbranches)
       ;; extend the environment
       (env-extend env key variable)))
   
@@ -122,17 +122,14 @@
             (for/list ([rhs (in-list valrhs)])
               (expand rhs ctx))))
 
-    ;; helper
-    (define (update-syntax! f)
-      (set! transids (f transids))
-      (when rec? (set! transs (f transs)))
-      (set! valids (f valids))
-      (when rec? (set! valrhs (f valrhs)))
-      (set! bodys (f bodys)))
-
     ;; Create the binding branch for this context
     (define branchid (gensym letsym))
-    (update-syntax! (lambda (s) (extend-branch s branchid phase)))
+    (define newbranches (make-newbranches))
+    (set! transids (extend-branch transids branchid newbranches))
+    (when rec? (set! transs (extend-branch transs branchid newbranches)))
+    (set! valids (extend-branch valids branchid newbranches))
+    (when rec? (set! valrhs (extend-branch valrhs branchid newbranches)))
+    (set! bodys (extend-branch bodys branchid newbranches))
 
     ;; Bind each trans id
     (define trans-keyss
@@ -141,7 +138,7 @@
           (define key (gensym (syntax-e id)))
           ;; make a binding and add it to all syntax
           (define b (local-binding key))
-          (update-syntax! (lambda (s) (add-binding! s id b branchid phase) s))
+          (add-binding! id (syntax-e id) phase b newbranches)
           key)))
 
     ;; Bind each val id
@@ -151,7 +148,7 @@
           (define key (gensym (syntax-e id)))
           ;; make a binding and add it to all syntax
           (define b (local-binding key))
-          (update-syntax! (lambda (s) (add-binding! s id b branchid phase) s))
+          (add-binding! id (syntax-e id) phase b newbranches)
           key)))
 
     (when rec?

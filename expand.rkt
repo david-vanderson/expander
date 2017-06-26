@@ -114,14 +114,14 @@
 (define (apply-transformer t s ctx)
   ;; Mark given syntax
   (define m (gensym 't))
-  (define marked-s (mark-pre s m))
+  (define marked-s (mark s m))
   ;; Call the transformer; the current expansion context may be needed
   ;; for `{free,bound}-identifier=?`
   (define transformed-s (parameterize ([current-expand-context ctx])
                           (t marked-s)))
   (unless (syntax? transformed-s)
     (error "transformer produced non-syntax:" transformed-s))
-  (define after-s (mark-post transformed-s m))
+  (define after-s (mark transformed-s m))
   after-s)
 
 
@@ -143,13 +143,12 @@
   (define body-ctx (struct-copy expand-context ctx
                                 [only-immediate? #t]))
 
-  ;; make a unique id for this definition context
-  (define defid (gensym 'def))
   (define phase (expand-context-phase ctx))
-
-  ;; add branch for this context to all syntax as a place
-  ;; to insert bindings we find
-  (set! bodys (extend-branch bodys defid phase))
+  
+  ;; make a unique branch for this definition context
+  (define branchid (gensym 'def))
+  (define newbranches (make-newbranches))
+  (set! bodys (extend-branch bodys branchid newbranches))
 
   (let loop ([body-ctx body-ctx]
              [bodys bodys]
@@ -166,6 +165,9 @@
       ;; because of the partial expand, exp-body will be:
       ;; - a list where the first identifier is a core form
       ;; - an identifier that is a variable, primitive, or core form
+
+      ;; the partial expand could have brought in new macro-introduced syntax
+      (set! exp-body (extend-branch exp-body branchid newbranches))
       
       (case (core-form-sym exp-body phase)
         [(begin)
@@ -187,10 +189,7 @@
              (define key (gensym (syntax-e id)))
              ;; make a binding and add it to all syntax
              (define b (local-binding key))
-             (add-binding! exp-body id b defid phase)
-             (add-binding! (cdr bodys) id b defid phase)
-             (add-binding! done-bodys id b defid phase)
-             (add-binding! val-binds id b defid phase)
+             (add-binding! id (syntax-e id) phase b newbranches)
              ;; extend the environment
              (env-extend env key variable)))
 
@@ -220,10 +219,7 @@
              (define key (gensym (syntax-e id)))
              ;; make a binding and add it to all syntax
              (define b (local-binding key))
-             (add-binding! exp-body id b defid phase)
-             (add-binding! (cdr bodys) id b defid phase)
-             (add-binding! done-bodys id b defid phase)
-             (add-binding! val-binds id b defid phase)
+             (add-binding! id (syntax-e id) phase b newbranches)
              key))
          (define vals (eval-for-syntaxes-binding (m 'rhs) (m 'id) ctx))
          (define extended-env (for/fold ([env (expand-context-env body-ctx)]) ([key (in-list keys)]

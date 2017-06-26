@@ -1,8 +1,6 @@
 #lang racket/base
-(require racket/set
-         "syntax.rkt"
+(require "syntax.rkt"
          "scope.rkt"
-         "phase.rkt"
          "namespace.rkt")
 
 (provide
@@ -42,8 +40,9 @@
   (define b (module-binding '#%core 0 sym
                             '#%core 0 sym
                             0))
-  (define s (extend-branch (datum->syntax #f sym) 'core-literal phase))
-  (add-binding! s s b 'core-literal phase)
+  (define nb (make-newbranches))
+  (define s (extend-branch (datum->syntax #f sym) 'core-literal nb))
+  (add-binding! s sym phase b nb)
   s)
 
 (define (free-identifier=? a b phase)
