@@ -1,4 +1,5 @@
 #lang racket
+;(require "match.rkt")
 
 (provide expand
          compile
@@ -18,8 +19,8 @@
 ;; Syntax objects
 
 (struct syntax (e        ; a symbol
-                mark     ; #t or #f to distinguish syntax introduced by a macro
-                ehs)     ; list of envheads, one for each phase
+                marks     ; set of unique ids for macro-introduced syntax
+                branches) ; list of branches
         #:transparent)
 
 ;; For now, all syntax object are identifiers:
@@ -35,13 +36,15 @@
 (define (datum->syntax v [ctx #f])
   (cond
    [(syntax? v) v]
-   [(symbol? v) (syntax v (and ctx (syntax-mark ctx)) (if ctx (syntax-ehs ctx) (list)))]
+   [(symbol? v) (syntax v
+                        (if ctx (syntax-marks ctx) (seteq))
+                        (if ctx (syntax-branches ctx) null))]
    [(list? v) (map (lambda (e) (datum->syntax e ctx)) v)]
    [else v]))
 
 (module+ test
   (check-equal? (datum->syntax 'a)
-                (syntax 'a #f (list)))
+                (syntax 'a (seteq) (list)))
   (check-equal? (datum->syntax 1)
                 1))
 
@@ -67,32 +70,31 @@
 ;; Compile time environment tree
 
 ;; A binding is either:
-;; a gensym for a local variable
-;; symbol for a core form or primitive
-;; procedure for macro
+;; type 'var val is gensym for a local variable
+;; type 'form val is symbol for a core form
+;; type 'prim val is symbol for core primitive
+;; type 'stx val is procedure for macro
+;; type 'stx with not a procedure is a syntax error
 
-(struct env (id       ; a symbol
-             binding  ; a binding
-             prev)    ; pointer to previous env that this env extends
-                      ; or #f if this is the first binding
-  #:transparent)
+(struct bind (sym phase type val) #:transparent)
 
-;; syntax objects all point to an envhead
-;; a binding form will insert an env into the front of the list
-;; a macro invocation will make a new envhead branch
-;; fully-expanded syntax copies this so it doesn't see new bindings
+;; place to add binds
+(struct branch (id [binds #:mutable]) #:transparent)
 
-(struct envhead (id     ; unique id to reanimate introduced syntax
-                 phase  ; integer
-                 env)   ; pointer to first env
-  #:transparent #:mutable)
+
+;; If identifiers are `bound-identifier=?`, they have
+;; the same marks so one will bind the other
+(define (bound-identifier=? a b)
+  (and (eq? (syntax-e a) (syntax-e b))
+       (equal? (syntax-marks a) (syntax-marks b))))
 
 
 (module+ test
 
   (define loc/a (gensym 'a))
-  (define eh/a (envhead (gensym 'eh) 0 (env 'z (gensym 'z)
-                                            (env 'a loc/a #f))))
+  (define branches/a (list
+                      (branch 'let (list (bind 'z 0 'var (gensym 'z))))
+                      (branch 'let (list (bind 'a 0 'var loc/a)))))
   ;; Simulates
   ;;   (let ([a 1])
   ;;     (let ([z 2])
@@ -101,100 +103,149 @@
 
   (define loc/b-out (gensym 'b))
   (define loc/b-in (gensym 'b))
-  (define eh/b (envhead (gensym 'eh) 0 (env 'b loc/b-in
-                                             (env 'b loc/b-out #f))))
+  (define branches/b (list
+                      (branch 'let (list (bind 'b 0 'var loc/b-in)))
+                      (branch 'let (list (bind 'b 0 'var loc/b-out)))))
   ;; Simulates
   ;;   (let ([b 1])
   ;;     (let ([b 2])
   ;;       ....))
   ;; where the inner `b` shadows the outer `b`
+
+  (check-equal? (bound-identifier=? (syntax 'a (seteq) branches/a)
+                                    (syntax 'a (seteq) branches/a))
+                #t)
+  (check-equal? (bound-identifier=? (syntax 'a (seteq) branches/a)
+                                    (syntax 'z (seteq) branches/a))
+                #f)
   
   (define loc/c (gensym 'c))
-  (define loc/c-m (gensym 'c-m))
+  (define loc/c-m (lambda (x) x))
   (define loc/c-u (gensym 'c-u))
-  (define env/before (env 'c-m loc/c-m #f))
-  (define eh/c (envhead (gensym 'eh) 0 (env 'c loc/c env/before)))
-  (define eh/c-u (envhead (gensym 'eh) 0 (env 'c loc/c-u env/before)))
+  (define bind/c-m (bind 'c-m 0 'stx loc/c-m))
+  (define stx/c (syntax 'c (seteq)
+                        (list
+                         (branch 'let (list))
+                         (branch 'let (list (bind 'c 0 'var loc/c)))
+                         (branch 'let-syntax (list bind/c-m)))))
+  (define stx/c-u (syntax 'c (seteq 't1)
+                          (list
+                           (branch 'let (list (bind 'c 0 'var loc/c-u)))
+                           (branch 'let-syntax (list bind/c-m)))))
   ;; Simulates
   ;      (let-syntax ((c-m (lambda (stx)  ; (c-m arg body) -> (let ((c arg)) body)
   ;                          (datum->syntax
+  ;                           (quote-syntax here)
   ;                           (cons (quote-syntax let)
   ;                            (cons (list (list (quote-syntax c) (car (cdr stx))))
   ;                             (cons (quote-syntax c)
   ;                              (cdr (cdr stx))))
-  ;                           (syntax-envhead (car stx))))))
+  ;
   ;        (let ([c 1])
   ;          (c-m 2
-  ;            ....)))
+  ;            c)))
   ;      =>
   ;        (let ([c 1])
   ;          (let ([c 2])
-  ;            c)    ; from macro
-  ;          c)      ; from body
+  ;            c    ; from macro
+  ;            c)   ; from body
   ;; where the inner c is from a macro, does not shadow
   )
 
-(define (syntax-eh s phase)
-  (findf (lambda (h) (= phase (envhead-phase h))) (syntax-ehs s)))
-
-;; Finds the env for a given identifier; returns #f if the
+;; Finds the bind for a given identifier; returns #f if the
 ;; identifier is unbound
-(define (resolve id phase)
-  (define eh (syntax-eh id phase))
-  (if (not eh) (error "can't find an envhead for phase" phase) (void))
-  (let loop ((e (envhead-env eh)))
+(define (resolve id phase (err? #f))
+  ;(printf "resolve ~v\n\n" id)
+  (let loop ((b (syntax-branches id)) (p phase))
     (cond
-      ((not e)  ; ran out of envs
-       #f)
-      ((equal? (syntax-e id) (env-id e))  ; found it
-       (env-binding e))
-      (else
-       (loop (env-prev e))))))
+      [(null? b)  ; ran out of branches
+       (if err?
+           (error "unbound identifier in phase:" phase id)
+           #f)]
+      [(branch? (car b))
+       (define bind (findf (lambda (bind)
+                             (and (eq? (syntax-e id) (bind-sym bind))
+                                  (equal? p (bind-phase bind))))
+                           (branch-binds (car b))))
+       (if bind                
+           bind
+           (loop (cdr b) p))])))
 
 
 (module+ test
-  (check-equal? (resolve (syntax 'a #f (list eh/a)) 0)
+  (check-equal? (bind-val (resolve (syntax 'a (seteq) branches/a) 0))
                 loc/a)
-  (check-equal? (resolve (syntax 'a #f (list eh/b)) 0)
+  (check-equal? (resolve (syntax 'a (seteq) branches/b) 0)
                 #f)
-  (check-equal? (resolve (syntax 'zzz #f (list eh/a)) 0)
+  (check-equal? (resolve (syntax 'zzz (seteq) branches/a) 0)
                 #f)
 
-  (check-equal? (resolve (syntax 'b #f (list eh/b)) 0)
+  (check-equal? (bind-val (resolve (syntax 'b (seteq) branches/b) 0))
                 loc/b-in)
-  (check-equal? (resolve (syntax 'zzz #f (list eh/b)) 0)
+  (check-equal? (resolve (syntax 'zzz (seteq) branches/b) 0)
                 #f)
 
-  (check-equal? (resolve (syntax 'c #f (list eh/c)) 0)
+  (check-equal? (bind-val (resolve stx/c 0))
                 loc/c)
-  (check-equal? (resolve (syntax 'c #f (list eh/c-u)) 0)
+  (check-equal? (bind-val (resolve stx/c-u 0))
                 loc/c-u)
-  (check-equal? (resolve (syntax 'c-m #f (list eh/c)) 0)
+  (check-equal? (bind-val (resolve (syntax 'c-m (seteq) (syntax-branches stx/c)) 0))
                 loc/c-m)
-  (check-equal? (resolve (syntax 'c-m #f (list eh/c-u)) 0)
+  (check-equal? (bind-val (resolve (syntax 'c-m (seteq) (syntax-branches stx/c-u)) 0))
                 loc/c-m))
 
 
-;; add to this envhead's chain of bindings
-(define (env-extend-binding! eh key val)
-  (set-envhead-env! eh (env key val (envhead-env eh))))
+(define (syntax-map s f)
+  (let loop ((s s))
+    (cond
+      [(syntax? s)
+       (f (struct-copy syntax s [e (loop (syntax-e s))]))]
+      [(list? s) (map loop s)]
+      [(pair? s) (cons (loop (car s))
+                       (loop (cdr s)))]
+      [else s])))
 
-;; remove most recent env in chain
-(define (env-pop! eh)
-  (set-envhead-env! eh (env-prev (envhead-env eh))))
 
-;; make a new envhead so it doesn't get extended anymore
-(define (eh-copy eh)
-  (envhead (envhead-id eh) (envhead-phase eh) (envhead-env eh)))
+(define (make-newbranches)
+  (make-hash))
 
-;; copy all the envhead so this syntax won't be bound be future bindings
-(define (freeze s)
-  (cond
-   [(syntax? s)
-    (syntax (syntax-e s) (syntax-mark s) (map eh-copy (syntax-ehs s)))]
-   [(list? s) (map freeze s)]
-   [else s]))
+(define (extend-branch s branchid newbranches)
+  (syntax-map s
+    (lambda (s)
+      (cond
+        [(and (not (null? (syntax-branches s)))
+              (ormap (lambda (b)
+                       (and (branch? b) (eq? branchid (branch-id b))))
+                     (syntax-branches s)))
+         ; already have this branch
+         ;(when (identifier? s)
+         ;  (printf "adding ~a branch ~a oldbranch\n" (syntax-e s) branchid))
+         s]
+        [else
+         (define nb (hash-ref newbranches (syntax-marks s) #f))
+         (when (not nb)
+           ;(when (identifier? s)
+           ;  (printf "adding ~a branch ~a newbranch\n" (syntax-e s) branchid))
+           (set! nb (branch branchid '()))
+           (hash-set! newbranches (syntax-marks s) nb))
+         ;(when (identifier? s)
+         ;  (printf "adding ~a branch ~a\n" (syntax-e s) branchid))
+         (struct-copy syntax s
+                      [branches (cons nb (syntax-branches s))])]))))
 
+
+  
+;; Determine whether two identifiers have the same binding
+(define (free-identifier=? a b phase)
+  (eq? (resolve a phase) (resolve b phase)))
+
+(module+ test
+  (check-equal? (free-identifier=? (syntax 'c-m (seteq) (syntax-branches stx/c))
+                                   (syntax 'c-m (seteq) (syntax-branches stx/c-u)) 0)
+                #t)
+  (check-equal? (free-identifier=? (syntax 'c (seteq) (syntax-branches stx/c))
+                                   (syntax 'c (seteq) (syntax-branches stx/c-u)) 0)
+                #f))
 
 ;; ----------------------------------------
 ;; Core syntax and primitives
@@ -203,64 +254,38 @@
 (define core-primitives (seteq 'datum->syntax 'syntax->datum 'syntax-e
                                'list 'cons 'car 'cdr 'map))
 
-(define core-env
-  (let ((eh (envhead #f #f #f)))
-    (for ([sym (in-set (set-union core-forms core-primitives))])
-      (env-extend-binding! eh sym sym))
-    (envhead-env eh)))
-  
-
-(module+ test
-  (define (eh/core) (envhead 'eh 0 core-env))
-  (define (ehc) (list (eh/core))))
+(define (core-branch phase)
+  (define b (branch 'core null))
+  (for ([sym (in-set core-primitives)])
+    (set-branch-binds! b (cons (bind sym phase 'prim sym) (branch-binds b))))
+  (for ([sym (in-set core-forms)])
+    (set-branch-binds! b (cons (bind sym phase 'form sym) (branch-binds b))))
+  b)
 
 
 ;; The `introduce` function adds all the core forms and primitives
-;; to the empty environment and adds that envhead to all syntax
-(define (introduce s (phase 0) (eh (envhead 'eh phase core-env)))
+;; to the given syntax in the given phase
+(define (introduce s (phase 0))
   (cond
-    ((syntax? s) (syntax (syntax-e s) (syntax-mark s)
-                         (if (syntax-eh s phase)
-                             (error "already have an envhead for this phase" phase)
-                             (cons eh (syntax-ehs s)))))
-    ((list? s) (map (lambda (v) (introduce v phase eh)) s))
+    ((syntax? s) (syntax (syntax-e s) (syntax-marks s)
+                         (cons (core-branch phase) (syntax-branches s))))
+    ((list? s) (map (lambda (v) (introduce v phase)) s))
     (else s)))
 
 
 (module+ test
-  (check-equal? (resolve (datum->syntax 'lambda (syntax 'zzz #f (list (envhead #f 0 #f)))) 0)
+  (check-equal? (resolve (datum->syntax 'lambda stx/c) 0)
                 #f)
-  (check-equal? (resolve (introduce (datum->syntax 'lambda)) 0)
+  (check-equal? (bind-val (resolve (introduce (datum->syntax 'lambda)) 0))
                 'lambda)) ; i.e., the core `lambda` form
 
 
-(define (mark v)
-  (cond
-   [(syntax? v) (syntax (syntax-e v) #t (syntax-ehs v))]
-   [(list? v) (map mark v)]
-   [else v]))
-
-(define (branch-introduced v phase)
-  (define ehh (make-hash))
-  (let branch-introduced* ((v v))
-    (cond
-      [(and (syntax? v) (not (syntax-mark v)))
-       ; introduced syntax, branch
-       (define eh (syntax-eh v phase))
-       (if (not eh) (error "can't find an envhead for phase" phase) (void))
-       
-       (define neweh (hash-ref ehh (envhead-id eh) #f))
-       (begin
-         (cond
-           [neweh (void)]
-           [else
-            (set! neweh (envhead (gensym 'eh) phase (envhead-env eh)))
-            ; map old id to new eh
-            (hash-set! ehh (envhead-id eh) neweh)])
-         (printf "branching adding ~a to ~a\n" (envhead-id neweh) (syntax-e v))
-         (syntax (syntax-e v) #f (cons neweh (remove eh (syntax-ehs v)))))]
-      [(list? v) (map branch-introduced* v)]
-      [else v])))
+(define (mark s m)
+  (syntax-map s
+    (lambda (s)
+      (define gotm? (set-member? (syntax-marks s) m))
+      (struct-copy syntax s
+                   [marks ((if gotm? set-remove set-add) (syntax-marks s) m)]))))
 
 
 ;; ----------------------------------------
@@ -285,53 +310,32 @@
                 '(lambda (x) x))
   
   ;; A reference to a core primitive expands to itself:
-  (check-equal? (expand (introduce (syntax 'cons #f (list))))
-                (syntax 'cons #f (ehc)))
+  (check-equal? (syntax->datum (expand (introduce (syntax 'cons (seteq) null))))
+                'cons)
   
   ;; A locally-bound variable expands to itself:
-  (check-equal? (expand (syntax 'a #f (list eh/a))) ; bound to `loc1` above
-                (syntax 'a #f (list eh/a)))
+  (check-equal? (expand (syntax 'a (seteq) branches/a)) ; bound to `loc1` above
+                (syntax 'a (seteq) branches/a))
   
   ;; A free variable triggers an error:
   (check-exn (make-exn:fail? "free variable")
              (lambda ()
-               (expand (syntax 'a #f (list (envhead 'eh 0 #f))))))
-  
-  ;; Application of a locally-bound variable to a number quotes the
-  ;; number argument expression:
-  (let [(eh (eh/core))]
-    (env-extend-binding! eh 'a loc/a)
-    (env-extend-binding! eh 'z (gensym 'z))
-    (check-equal? (expand (list (syntax 'a #f (list eh))
-                                (list (syntax 'quote #f (list eh)) 1)))
-                  (list (syntax 'a #f (list eh))
-                        (list (syntax 'quote #f (list eh))
-                              1))))
-
-  ;; Application of a number to a number expands to an application
-  ;; (but will be a run-time error if evaluated):
-  (check-equal? (expand (introduce
-                         (datum->syntax '('0 '1))))
-                (list (list (syntax 'quote #f (list (envhead 'eh 0 core-env)))
-                            0)
-                      (list (syntax 'quote #f (list (envhead 'eh 0 core-env)))
-                            1)))
+               (expand (syntax 'a (seteq) null))))
   
   ;; A locally-bound macro expands by applying the macro:
-  (define ehc1 (ehc))
   (check-equal? (syntax->datum
-                 (expand (list (syntax 'a #f (list (envhead 'eh 0 (env 'a (lambda (s)
-                                                                            (list (syntax 'quote #f ehc1)
-                                                                                  1)) core-env)))))))
+                 (expand (syntax 'a (seteq)
+                                 (list (branch 'blah
+                                               (list (bind 'a 0 'stx
+                                                           (lambda (stx)
+                                                             (list (syntax 'quote (seteq) (list (core-branch 0))) 1)))))))))
                 '(quote 1))
-  (check-equal? (syntax->datum
-                 (expand (datum->syntax '(a (lambda (x) x))
-                                        (syntax 'zzz #f (list (envhead 'eh 0
-                                                                       (env 'a (lambda (s) (list-ref s 1)) core-env)))))))
-                '(lambda (x) x))
   )
+
+
 ;; Main expander entry point and loop:
 (define (expand s (phase 0))
+  ;(printf "expand ~v\n\n" (syntax->datum s))
   (cond
    [(identifier? s)
     ;; An identifier by itself
@@ -351,117 +355,140 @@
 (define (expand-identifier s phase)
   ;(printf "expand-identifier ~v\n" s)
   (define binding (resolve s phase))
-  (cond
-   [(not binding)
-    (error "free variable:" s "in phase" phase)]
-   [(set-member? core-primitives binding)
-    (freeze s)]
-   [(set-member? core-forms binding)
-    (error "bad syntax:" s)]
-   [else
-    (freeze s)]))
+  (if (not binding)
+      (error "free variable:" s "in phase" phase)
+      (void))
+  
+  (case (bind-type binding)
+    [(form)
+     (error "bad syntax:" s)]
+    [(stx)
+     (if (procedure? (bind-val binding))
+         (expand (apply-transformer (bind-val binding) s))
+         (error "illegal use of syntax:" s))]
+    [else
+     s]))
 
 ;; An "application" form that starts with an identifier
 (define (expand-id-application-form s phase)
   ;(printf "expand-id-app\n")
   (define id (car s))
   (define binding (resolve id phase))
+  (if (not binding)
+      (error "free variable:" s "in phase" phase)
+      (void))
   ;(printf "expand-id-app binding ~v\n" binding)
-  (case binding
-    [(lambda)
-     ;(printf "expand-id-app lambda ~v\n" s)
-     (expand-lambda s phase)]
-    [(let-syntax)
-     ;(printf "expand-id-app let-syntax ~v\n" s)
-     (expand-let-syntax s phase)]
-    [(quote quote-syntax)
-     ;(printf "expand-id-app quotes ~v\n" s)
-     (freeze s)]
-    [else
-     (cond
-       [(procedure? binding)
-        ;(printf "expand-id-app procedure ~v\n" s)
-        ;; Apply transformer, then recur
-        (expand (apply-transformer binding s phase))]
+  
+  (case (bind-type binding)
+    [(form)
+     (case (bind-val binding)
+       [(lambda)
+        ;(printf "expand-id-app lambda ~v\n" s)
+        (expand-lambda s phase)]
+       [(let-syntax)
+        (expand-let-syntax s phase)]
+       [(quote quote-syntax)
+        ;(printf "expand-id-app quotes ~v\n" s)
+        s]
        [else
-        ;(printf "expand-id-app app ~v\n" s)
-        (expand-app s phase)])]))
+        (error "missed a core form in expand-id-application-form" (bind-val binding))])]
+    [(stx)
+     (if (procedure? (bind-val binding))
+         (expand (apply-transformer (bind-val binding) s))
+         (error "illegal use of syntax:" s))]
+    [else
+     ;(printf "expand-id-app app ~v\n" s)
+     (expand-app s phase)]))
 
 ;; Given a macro transformer `t`, apply it --- adding appropriate
 ;; scopes to represent the expansion step
-(define (apply-transformer t s phase)
+(define (apply-transformer t s)
   ;; Mark given syntax
-  (define marked-s (mark s))
+  (define m (gensym 't))
+  (define marked-s (mark s m))
   ;; Call the transformer
   ;(printf "before t: ~v\n\n" marked-s)
   (define t-s (t marked-s))
   ;(printf "after t: ~v\n\n" t-s)
-  (define after-s (branch-introduced t-s phase))
+  (define after-s (mark t-s m))
   ;(printf "after b: ~v\n\n" after-s)
   after-s)
 
-#;
 (module+ test
-  ;; Check that applying a macro transformer adds a scope to
+  ;; Check that applying a macro transformer branches the
   ;; introduced parts and leaves original parts alone:
-  (define transformer
-    (lambda (s)
-       ;; This transformer converts `(_ f)` to `(f x)`
-       (list (list-ref s 1)
-             (datum->syntax 'x))))
+  (let ()
+    (define t (lambda (s)
+                ;; This transformer converts `(_ f)` to `(f x)`
+                (list (list-ref s 1)
+                      (datum->syntax 'x (syntax 'zzz (seteq) null)))))
+
+    (define transformed-s
+      (apply-transformer t
+                         (list (syntax 'm (seteq) null)
+                               (syntax 'f (seteq) null))))
   
-  (define eh (envhead #f))
-  (env-extend-binding! eh 'm transformer)
-  (define transformed-s
-    (apply-transformer
-     transformer
-     (list (syntax 'm #f eh)
-           (syntax 'f #f eh))))
-  
-  (check-equal? (syntax->datum transformed-s)
-                '(f x))
-  (check-equal? (list-ref transformed-s 0)
-                (syntax 'f #f (env-branch (syntax 'm #f eh)))))
+    (check-equal? (syntax->datum transformed-s)
+                  '(f x))
+    (check-equal? (set-count (syntax-marks (list-ref transformed-s 0)))
+                  0)
+    (check-equal? (set-count (syntax-marks (list-ref transformed-s 1)))
+                  1)
+    )
+  )
+
+
+(define (add-binding! ctx sym phase type val newbranches)
+  (define nb (hash-ref newbranches (syntax-marks ctx) #f))
+  (when (not nb) 
+    (error "add-binding! couldn't find newbranch for" ctx))
+  (set-branch-binds! nb (cons (bind sym phase type val) (branch-binds nb))))
 
 ;; ----------------------------------------
 
 (define (expand-lambda s phase)
-  ;(printf "expand-lambda ~v\n" s)
+  ;(printf "expand-lambda (~a) ~v\n\n" phase s)
   (match-define `(,lambda-id (,arg-id) ,body) s)
-  (set! lambda-id (freeze lambda-id))
-  ;; Get the env branch from the binding variable
-  (define eh (syntax-eh arg-id phase))
-  (if (not eh) (error "can't find an envhead for phase" phase) (void))
+
+  ;; make new branches to add bindings to
+  (define branchid (gensym 'lambda))
+  (define newbranches (make-newbranches))
+  (set! arg-id (extend-branch arg-id branchid newbranches))
+  (set! body (extend-branch body branchid newbranches))
+
+  ;; bind the argument
   (define sym (syntax-e arg-id))
-  ;; Add the new binding
-  (env-extend-binding! eh sym (gensym sym))
-  ;; Freeze env chain on arg-id
-  (set! arg-id (freeze arg-id))  ;; probably don't need this
+  (add-binding! arg-id sym phase 'var (gensym sym) newbranches)
+  
   ;; Expand the function body:
   (define exp-body (expand body phase))
-  ;; Remove the new binding
-  (env-pop! eh)
+
   (list lambda-id (list arg-id) exp-body))
 
 (define (expand-let-syntax s phase)
-  ;(printf "expand-let-syntax ~v\n" s)
+  ;(printf "expand-let-syntax ~v\n\n" s)
   (match-define `(,let-syntax-id ([,lhs-id ,rhs])
                     ,body)
                 s)
-  (set! let-syntax-id (freeze let-syntax-id))
+
+  ;; make new branches to add bindings to
+  (define branchid (gensym 'let-syntax))
+  (define newbranches (make-newbranches))
+  (set! lhs-id (extend-branch lhs-id branchid newbranches))
+  (set! body (extend-branch body branchid newbranches))
+  
   ;; Evaluate compile-time expressions:
-  (define rhs-val (eval-for-syntax-binding rhs (+ phase 1)))
-  ;; Get the env branch from the binding variable
-  (define eh (syntax-eh lhs-id phase))
-  (if (not eh) (error "can't find an envhead for phase" phase) (void))
+  ;(printf "eval-for-syntax\n\n")
+  (define rhs-val (eval-for-syntax-binding rhs (add1 phase)))
+
+  ;; add binding
   (define sym (syntax-e lhs-id))
-  ;; Add the new binding
-  (env-extend-binding! eh sym rhs-val)
-  (set! lhs-id (freeze lhs-id))
+  (add-binding! lhs-id sym phase 'stx rhs-val newbranches)
+
+  ;(printf "expanding body  ~v\n\n" body)
   ;; Expand body
   (define exp-body (expand body phase))
-  ;; Remove the new binding
-  (env-pop! eh)
+
   exp-body)
 
 ;; Expand an application (i.e., a function call)
@@ -475,6 +502,7 @@
   (define expanded-rhs (expand (introduce rhs phase) phase))
   ;(write expanded-rhs)
   ;(newline)
+  ;(printf "compiling ~v\n\n" expanded-rhs)
   (define compiled-rhs (compile expanded-rhs phase))
   ;(write compiled-rhs)
   ;(newline)
@@ -482,8 +510,9 @@
 
 
 (module+ test
-  (check-equal? (eval-for-syntax-binding (datum->syntax
-                                          '(car (list '1 '2))) 1)
+  (check-equal? (eval-for-syntax-binding
+                 (introduce (datum->syntax
+                             '(car (list '1 '2))) 1) 1)
                 1)
   
   (check-equal? ((eval-for-syntax-binding (datum->syntax
@@ -496,14 +525,15 @@
 ;; Convert an expanded syntax object to an expression that is
 ;; represented by a plain S-expression.
 (define (compile s (phase 0))
+  ;(printf "compile ~v\n\n" (syntax->datum s))
   (cond
    [(pair? s)
-    (define core-sym (and (identifier? (car s))
-                          (resolve (car s) phase)))
-    (case core-sym
+    (define binding (and (identifier? (car s))
+                         (resolve (car s) phase)))
+    (case (and binding (bind-val binding))
       [(lambda)
-       (match-define `(,lambda-id (,id) ,body) s)
-       `(lambda (,(resolve id phase)) ,(compile body phase))]
+       (match-define `(,lambda-id (,ids ...) ,body) s)
+       `(lambda ,(map (lambda (id) (bind-val (resolve id phase))) ids) ,(compile body phase))]
       [(quote)
        (match-define `(,quote-id ,datum) s)
        ;; Strip away scopes:
@@ -513,10 +543,10 @@
        ;; Preserve the complete syntax object:
        `(quote ,datum)]
       [else
-       ;; Application:
-       (map (lambda (v) (compile v phase)) s)])]
+       ;; Application
+       (map (lambda (s) (compile s phase)) s)])]
    [(identifier? s)
-    (resolve s phase)]
+    (bind-val (resolve s phase))]
    [else
     (error "bad syntax after expansion:" s)]))
 
