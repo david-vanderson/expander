@@ -11,21 +11,23 @@
 
 (add-core-form!
  'lambda
- (lambda (s env)
+ (lambda (s env phase)
    (define m (match-syntax s '(lambda (id ...) body)))
-   (define sc (new-scope))
-   ;; Check formal arguments:
-   (define ids (for/list ([id (in-list (m 'id))])
-                 (add-scope id sc)))
+   (define branchid (gensym 'lambda))
+   (define newbranches (make-newbranches))
+   (define ids (extend-branch (m 'id) branchid newbranches))
+   (define body (extend-branch (m 'body) branchid newbranches))
    ;; Bind each argument and generate a corresponding key for the
    ;; expand-time environment:
    (define keys (for/list ([id (in-list ids)])
-                  (add-local-binding! id)))
+                  (define key (gensym (syntax-e id)))
+                  (define b (local-binding key))
+                  (add-binding! id (syntax-e id) phase b newbranches)
+                  key))
    (define body-env (for/fold ([env env]) ([key (in-list keys)])
                       (env-extend env key variable)))
    ;; Expand the function body:
-   (define exp-body (expand (add-scope (m 'body) sc)
-                            body-env))
+   (define exp-body (expand body body-env phase))
    (rebuild
     s
     `(,(m 'lambda) ,ids ,exp-body))))
@@ -34,33 +36,40 @@
 
 (add-core-form!
  'let-syntax
- (lambda (s env)
+ (lambda (s env phase)
    (define m (match-syntax s '(let-syntax ([trans-id trans-rhs]
                                            ...)
                                  body)))
-   (define sc (new-scope))
-   ;; Add the new scope to each binding identifier:
-   (define trans-ids (for/list ([id (in-list (m 'trans-id))])
-                       (add-scope id sc)))
+
+   (define branchid (gensym 'let-syntax))
+   (define newbranches (make-newbranches))
+   (define trans-ids (extend-branch (m 'trans-id) branchid newbranches))
+   (define body (extend-branch (m 'body) branchid newbranches))
+
+   ;; Evaluate compile-time expressions before binding:
+   (define trans-vals (for/list ([rhs (in-list (m 'trans-rhs))])
+                        (eval-for-syntax-binding rhs env phase)))
+   
    ;; Bind each left-hand identifier and generate a corresponding key
    ;; for the expand-time environment:
    (define trans-keys (for/list ([id (in-list trans-ids)])
-                        (add-local-binding! id)))
-   ;; Evaluate compile-time expressions:
-   (define trans-vals (for/list ([rhs (in-list (m 'trans-rhs))])
-                        (eval-for-syntax-binding rhs env)))
+                        (define key (gensym (syntax-e id)))
+                        (define b (local-binding key))
+                        (add-binding! id (syntax-e id) phase b newbranches)
+                        key))
+   
    ;; Fill expansion-time environment:
    (define body-env (for/fold ([env env]) ([key (in-list trans-keys)]
                                            [val (in-list trans-vals)])
                       (env-extend env key val)))
    ;; Expand body
-   (expand (add-scope (m 'body) sc) body-env)))
+   (expand body body-env phase)))
 
 ;; ----------------------------------------
 
 (add-core-form!
  '#%app
- (lambda (s env)
+ (lambda (s env phase)
    (define m (match-syntax s '(#%app rator rand ...)))
    (rebuild
     s
@@ -71,12 +80,12 @@
 
 (add-core-form!
  'quote
- (lambda (s env)
+ (lambda (s env phase)
    (match-syntax s '(quote datum))
    s))
 
 (add-core-form!
  'quote-syntax
- (lambda (s env)
+ (lambda (s env phase)
    (match-syntax s '(quote-syntax datum))
    s))

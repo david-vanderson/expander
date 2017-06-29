@@ -1,79 +1,138 @@
 #lang racket/base
 (require racket/set
-         racket/list
          "syntax.rkt")
 
-(provide new-scope
-         add-scope
-         flip-scope
-         
+(provide resolve
+         introduce
+
+         (struct-out branch)
+         (struct-out bind)
+
+         make-newbranches
+         extend-branch
          add-binding!
-         resolve)
+         mark)
 
-;; A scope represents a distinct "dimension" of binding.
-;; Scope identity is `eq?` identity.
+;; Each syntax object has a list of branches that hold bindings
+;; that affect this syntax.  We resolve to the first binding in
+;; the branch list with the given phase.
 
-(struct scope ())
+;; As we expand a binding context, we add a branch to the front of
+;; all syntax in the binding context.  Syntax with the same marks
+;; share the same new branch.  Then for each identifier being bound
+;; we add a binding to the shared branch that matches the
+;; identifier's marks.  This 2-step process provides the delay needed
+;; when binding in a definition context.
 
-(define (new-scope) (scope))
+;; Each macro invocation adds a unique mark to introduced syntax.
+;; This works by marking syntax going into the macro, and then
+;; flipping the mark on all syntax coming out.
 
-;; Add or flip a scope everywehere (i.e., including nested syntax)
-(define (adjust-scope s/e sc op)
-  (cond
-   [(syntax? s/e) (struct-copy syntax s/e
-                               [e (adjust-scope (syntax-e s/e) sc op)]
-                               [scopes (op (syntax-scopes s/e) sc)])]
-   [(list? s/e) (map (lambda (s) (adjust-scope s sc op)) s/e)]
-   [else s/e]))
+(struct bind (sym
+              phase
+              binding)  ; either module-binding? or local-binding?
+  #:transparent)
 
-(define (add-scope s sc)
-  (adjust-scope s sc set-add))
+;; branch is mutable for definition contexts
+(struct branch (id       ; unique id for this binding context
+                [binds #:mutable])  ; list of bindings
+  #:transparent)
 
-(define (set-flip s e)
-  (if (set-member? s e)
-      (set-remove s e)
-      (set-add s e)))
 
-(define (flip-scope s sc)
-  (adjust-scope s sc set-flip))
+(define (syntax-map s f)
+  (let loop ((s s))
+    (cond
+      [(syntax? s)
+       (f (struct-copy syntax s [e (loop (syntax-e s))]))]
+      [(list? s) (map loop s)]
+      [(pair? s) (cons (loop (car s))
+                       (loop (cdr s)))]
+      [else s])))
 
-;; ----------------------------------------
 
-;; Global table of bindings
-(define all-bindings
+(define (introduce s branch)
+  (syntax-map s
+    (lambda (s)
+      (struct-copy syntax s
+                   [branches (cond
+                               [(not branch)
+                                null]  ;; used to wipe context
+                               [(list? branch)
+                                (append branch (syntax-branches s))]
+                               [else
+                                (cons branch (syntax-branches s))])]))))
+
+
+;; newbranches is a mutable hash that maps mark sets to new branch structs
+;; use it to add bindings:
+;; (define newbranches (make-newbranches))
+;; (extend-branch <syntax> (gensym) newbranches)
+;; (for ((id <ids-to-bind>))
+;;   (add-binding! ctx sym <phase> <binding> newbranches))
+(define (make-newbranches)
   (make-hash))
 
-(define (add-binding! id binding)
-  (unless (identifier? id)
-    (raise-argument-error 'resolve "identifier?" id))
-  (hash-set! all-bindings id binding))
 
-;; Finds the binding for a given identifier; returns #f if the
-;; identifier is unbound
-(define (resolve id)
-  (define candidate-ids (find-all-matching-bindings id))
-  (cond
-   [(pair? candidate-ids)
-    (define max-candidate-id
-      (argmax (lambda (c-id) (set-count (syntax-scopes c-id)))
-              candidate-ids))
-    (check-unambiguous max-candidate-id candidate-ids id)
-    (hash-ref all-bindings max-candidate-id)]
-   [else #f]))
+;; Add a new branch to all syntax s.  Syntax with the same marks share
+;; a copy of the new branch.  Every new branch is recorded in newbranches
+;; as a place to add-binding!
+(define (extend-branch s branchid newbranches)
+  (syntax-map s
+    (lambda (s)
+      (cond
+        [(and (not (null? (syntax-branches s)))
+              (ormap (lambda (b)
+                       (and (branch? b) (eq? branchid (branch-id b))))
+                     (syntax-branches s)))
+         ; already have this branch
+         ;(when (identifier? s)
+         ;  (printf "adding ~a branch ~a oldbranch\n" (syntax-e s) branchid))
+         s]
+        [else
+         (define nb (hash-ref newbranches (syntax-marks s) #f))
+         (when (not nb)
+           ;(when (identifier? s)
+           ;  (printf "adding ~a branch ~a newbranch\n" (syntax-e s) branchid))
+           (set! nb (branch branchid '()))
+           (hash-set! newbranches (syntax-marks s) nb))
+         ;(when (identifier? s)
+         ;  (printf "adding ~a branch ~a\n" (syntax-e s) branchid))
+         (struct-copy syntax s
+                      [branches (cons nb (syntax-branches s))])]))))
+      
 
-;; Find all candidiate bindings for `id` as the ones with
-;; a subset of the scopes of `id`
-(define (find-all-matching-bindings id)
-  (for/list ([(c-id) (in-hash-keys all-bindings)]
-             #:when (and (eq? (syntax-e c-id) (syntax-e id))
-                         (subset? (syntax-scopes c-id) (syntax-scopes id))))
-    c-id))
+;; Pick the branch in newbranches with the same marks as id
+;; and insert the new binding
+(define (add-binding! ctx sym phase binding newbranches)
+  (define nb (hash-ref newbranches (syntax-marks ctx) #f))
+  (when (not nb)
+    (error "add-binding! couldn't find newbranch for" ctx))
+  (set-branch-binds! nb (cons (bind sym phase binding) (branch-binds nb))))
 
-;; Check that the binding with the biggest scope set is a superset
-;; of all the others
-(define (check-unambiguous max-candidate-id candidate-ids error-id)
-  (for ([c-id (in-list candidate-ids)])
-    (unless (subset? (syntax-scopes c-id)
-                     (syntax-scopes max-candidate-id))
-      (error "ambiguous:" error-id))))
 
+(define (resolve id phase (err? #f))
+  (let loop ((b (syntax-branches id)) (p phase))
+    (cond
+      [(null? b)  ; ran out of branches
+       (if err?
+           (error "unbound identifier in phase:" phase id)
+           #f)]
+      [(branch? (car b))
+       (define bind (findf (lambda (bind)
+                             (and (eq? (syntax-e id) (bind-sym bind))
+                                  (equal? p (bind-phase bind))))
+                           (branch-binds (car b))))
+       (if bind
+           (bind-binding bind)
+           (loop (cdr b) p))])))
+
+;; ------------------------------------------
+
+;; set a mark m on all syntax going into a macro,
+;; or remove mark if we have it already (coming out of a macro)
+(define (mark s m)
+  (syntax-map s
+    (lambda (s)
+      (define gotm? (set-member? (syntax-marks s) m))
+      (struct-copy syntax s
+                   [marks ((if gotm? set-remove set-add) (syntax-marks s) m)]))))

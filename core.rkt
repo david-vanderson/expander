@@ -6,44 +6,48 @@
          "binding.rkt"
          "match.rkt")
 
-(provide core-scope
-         core-stx
+(provide core-literal
+         core-branch
          
          add-core-form!
          add-core-primitive!
-         
+
          core-forms
          core-primitives
          
          core-form-sym)
 
-;; Accumulate all core bindings in `core-scope`, so we can
-;; easily generate a reference to a core form using `core-stx`:
-(define core-scope (new-scope))
-(define core-stx (add-scope empty-syntax core-scope))
+;; Generate an identifier that resolves to the core primitive/form
+(define (core-literal sym phase)
+  (define id (datum->syntax #f sym))
+  (define b (bind sym phase (core-binding sym)))
+  (struct-copy syntax id
+               [branches (list (branch 'core-literal (list b)))]))
+
+(define (core-branch phase)
+  (define b (branch 'core null))
+  (for ([sym (in-sequences (in-hash-keys core-primitives)
+                           (in-hash-keys core-forms))])
+    (set-branch-binds! b (cons (bind sym phase (core-binding sym)) (branch-binds b))))
+  b)
 
 ;; Core forms are added by `require`s in "main.rkt"
 
-;; Accumulate core forms and primitives:
+;; Accumulate added core forms and primitives:
 (define core-forms (make-hasheq))
 (define core-primitives (make-hasheq))
 
 (define (add-core-form! sym proc)
-  (add-core-binding! sym)
   (hash-set! core-forms sym proc))
 
 (define (add-core-primitive! sym val)
-  (add-core-binding! sym)
   (hash-set! core-primitives sym val))
 
-(define (add-core-binding! sym)
-  (add-binding! (datum->syntax core-stx sym)
-                (core-binding sym)))
-
 ;; Helper for recognizing and dispatching on core forms:
-(define (core-form-sym s)
+(define (core-form-sym s phase)
   (define m (try-match-syntax s '(id . _)))
   (and m
-       (let ([b (resolve (m 'id))])
+       (let ([b (resolve (m 'id) phase)])
          (and (core-binding? b)
               (core-binding-sym b)))))
+

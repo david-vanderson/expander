@@ -8,7 +8,7 @@
 
 (define (compile+eval-expression e)
   (define c
-    (compile (expand-expression e)))
+    (compile (expand-expression e) 0))
   (values c
           (eval c)))
 

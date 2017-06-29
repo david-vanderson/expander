@@ -1,29 +1,28 @@
-#lang racket
+#lang racket/base
+
+(require racket/set)
 
 (provide
  (struct-out syntax) ; includes `syntax?` and `syntax-e`
- empty-syntax
  identifier?
  bound-identifier=?
  
  syntax->datum
  datum->syntax)
 
-(struct syntax (e        ; datum and nested syntax objects
-                scopes)  ; scopes that apply at all phases
-        #:transparent)
+(struct syntax (e      ; datum and nested syntax objects
+                marks  ; set of unique ids used to distinguish macro-introduced syntax
+                branches) ; list of branches to hold bindings
+  #:transparent)
 
-(define empty-scopes (seteq))
-
-(define empty-syntax
-  (syntax #f empty-scopes))
+(define empty-marks (seteq))
 
 (define (identifier? s)
   (and (syntax? s) (symbol? (syntax-e s))))
 
 (define (bound-identifier=? a b)
   (and (eq? (syntax-e a) (syntax-e b))
-       (equal? (syntax-scopes a) (syntax-scopes b))))
+       (equal? (syntax-marks a) (syntax-marks b))))
 
 (define (syntax->datum s)
   (let ([e (syntax-e s)])
@@ -33,11 +32,11 @@
 
 (define (datum->syntax stx-c v)
   (define (wrap e)
-    (syntax e (if stx-c
-                  (syntax-scopes stx-c)
-                  empty-scopes)))
+    (syntax e
+            (if stx-c (syntax-marks stx-c) empty-marks)
+            (if stx-c (syntax-branches stx-c) null)))
   (cond
-   [(syntax? v) v]
-   [(list? v) (wrap (map (lambda (elem-v) (datum->syntax stx-c elem-v))
-                         v))]
-   [else (wrap v)]))
+    [(syntax? v) v]
+    [(list? v) (wrap (map (lambda (elem-v) (datum->syntax stx-c elem-v))
+                          v))]
+    [else (wrap v)]))

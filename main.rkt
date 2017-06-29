@@ -24,10 +24,10 @@
 
 (define (namespace-syntax-introduce s)
   ;; The only initial bindings are in the core scope
-  (add-scope s core-scope))
+  (introduce s (core-branch 0)))
  
 (define (expand s)
-  (expand-in-env s empty-env))
+  (expand-in-env s empty-env 0))
 
 (define (eval s)
   ;; Assume that `s` is compiled

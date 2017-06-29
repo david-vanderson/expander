@@ -11,20 +11,20 @@
 
 ;; Convert an expanded syntax object to an expression that is represented
 ;; by a plain S-expression.
-(define (compile s)
+(define (compile s phase)
   (cond
    [(pair? (syntax-e s))
-    (define core-sym (core-form-sym s))
+    (define core-sym (core-form-sym s phase))
     (case core-sym
       [(#f)
        (error "not a core form:" s)]
       [(lambda)
        (define m (match-syntax s '(lambda (id ...) body)))
-       `(lambda ,(map local->symbol (m 'id)) ,(compile (m 'body)))]
+       `(lambda ,(map (lambda (s) (local->symbol s phase)) (m 'id)) ,(compile (m 'body) phase))]
       [(#%app)
        (define m (match-syntax s '(#%app . rest)))
        (for/list ([s (in-list (m 'rest))])
-         (compile s))]
+         (compile s phase))]
       [(quote)
        (define m (match-syntax s '(quote datum)))
        `(quote ,(syntax->datum (m 'datum)))]
@@ -34,7 +34,7 @@
       [else
        (error "unrecognized core form:" core-sym)])]
    [(identifier? s)
-    (define b (resolve s))
+    (define b (resolve s phase))
     (cond
      [(local-binding? b)
       (define sym (key->symbol (local-binding-key b)))
@@ -51,8 +51,8 @@
 
 ;; ----------------------------------------
          
-(define (local->symbol id)
-  (define b (resolve id))
+(define (local->symbol id phase)
+  (define b (resolve id phase))
   (unless (local-binding? b)
     (error "bad binding:" id))
   (key->symbol (local-binding-key b)))

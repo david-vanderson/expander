@@ -7,7 +7,6 @@
  (struct-out core-binding)
  (struct-out local-binding)
  free-identifier=?
- add-local-binding!
  
  empty-env
  env-extend
@@ -46,12 +45,6 @@
     (and (local-binding? bb)
          (eq? (local-binding-key ab)
               (local-binding-key bb)))]))
-
-;; Helper for registering a local binding in a set of scopes:
-(define (add-local-binding! id)
-  (define key (gensym (syntax-e id)))
-  (add-binding! id (local-binding key))
-  key)
 
 ;; ----------------------------------------
 
