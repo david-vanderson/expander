@@ -2,18 +2,28 @@
 
 (provide
  (struct-out syntax) ; includes `syntax?` and `syntax-e`
+ empty-syntax
  identifier?
+ bound-identifier=?
  
  syntax->datum
  datum->syntax)
 
-(struct syntax (e      ; datum and nested syntax objects
-                mark   ; #t or #f to distinguish introduced syntax
-                tips)  ; list of tips, one for each phase
-  #:transparent)
+(struct syntax (e        ; datum and nested syntax objects
+                scopes)  ; scopes that apply at all phases
+        #:transparent)
+
+(define empty-scopes (seteq))
+
+(define empty-syntax
+  (syntax #f empty-scopes))
 
 (define (identifier? s)
   (and (syntax? s) (symbol? (syntax-e s))))
+
+(define (bound-identifier=? a b)
+  (and (eq? (syntax-e a) (syntax-e b))
+       (equal? (syntax-scopes a) (syntax-scopes b))))
 
 (define (syntax->datum s)
   (let ([e (syntax-e s)])
@@ -23,9 +33,9 @@
 
 (define (datum->syntax stx-c v)
   (define (wrap e)
-    (syntax e #f (if stx-c
-                     (syntax-tips stx-c)
-                     (list))))
+    (syntax e (if stx-c
+                  (syntax-scopes stx-c)
+                  empty-scopes)))
   (cond
    [(syntax? v) v]
    [(list? v) (wrap (map (lambda (elem-v) (datum->syntax stx-c elem-v))
