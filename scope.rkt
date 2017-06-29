@@ -4,63 +4,47 @@
 
 (provide resolve
          bound-identifier=?
-         free-identifier=?
          introduce
 
-         (struct-out bind)
          (struct-out branch)
+         (struct-out bind)
+
          make-newbranches
          extend-branch
          add-binding!
-         mark
-         )
+         mark)
 
 ;; Each syntax object has a list of branches that hold bindings
-;; that affect this syntax.  The first binding in the right phase
-;; is what we resolve to.
+;; that affect this syntax.  We resolve to the first binding in
+;; the branch list with the given phase.
 
 ;; As we expand a binding context, we add a branch to the front of
-;; every syntax's branch list in that context.  Then for each
-;; identifier being bound, we add a binding to the branch shared
-;; by all syntax with that identifier's marks.
+;; all syntax in the binding context.  Syntax with the same marks
+;; share the same new branch.  Then for each identifier being bound
+;; we add a binding to the shared branch that matches the
+;; identifier's marks.  This 2-step process provides the delay needed
+;; when binding in a definition context.
 
-;; For each macro invocation, we take introduced syntax and mark
-;; it with a unique symbol.  This creates the extra dimension of
-;; binding that hygiene requires.
+;; Each macro invocation adds a unique mark to introduced syntax.
+;; This works by marking syntax going into the macro, and then
+;; flipping the mark on all syntax coming out.
+
+(struct bind (sym
+              phase
+              binding)  ; either module-binding? or local-binding?
+  #:transparent)
 
 ;; branch is mutable for definition contexts
 (struct branch (id       ; unique id for this binding context
-                [binds #:mutable])  ; list of binds
-  #;#:transparent)
-
-;; type 'var  -> val is gensym for local variable
-;; type 'form -> val is core form
-;; type 'prim -> val is core primitive
-;; type 'stx  -> val is procedure? for macro, else syntax error
-;; val is mutable so in letrec-syntaxes we can bind all the ids
-;; first and then patch the vals in later
-(struct bind (phase
-              id    ; symbol
-              type  ; see above
-              [val #:mutable])
-  #;#:transparent)
-
-
-;; syntax s1 could bind s1 if they have the same marks
-(define (could-bind? s1 s2)
-  (equal? (syntax-marks s1) (syntax-marks s2)))
+                [binds #:mutable])  ; list of bindings
+  #:transparent)
 
 
 ;; a will bind b if they have the same symbol, marks, and marks-pre
 ;; binding is reflexive
-(define (bound-identifier=? a b phase)
+(define (bound-identifier=? a b (phase #f))
   (and (eq? (syntax-e a) (syntax-e b))
-       (could-bind? a b)))
-
-
-(define (free-identifier=? a b phase)
-  ; do these resolve to the same binding?
-  (eq? (resolve a phase) (resolve b phase)))
+       (equal? (syntax-marks a) (syntax-marks b))))
 
 
 (define (syntax-map s f)
@@ -77,26 +61,40 @@
 (define (introduce s branch)
   (syntax-map s
     (lambda (s)
-      ;(when (not (null? (syntax-branches s)))
-      ;  (error "already have a branch" s))
       (struct-copy syntax s
-                   [branches (cons branch (syntax-branches s))]))))
+                   [branches (cond
+                               [(not branch)
+                                empty-branches]  ;; used to wipe context
+                               [(list? branch)
+                                (append branch (syntax-branches s))]
+                               [else
+                                (cons branch (syntax-branches s))])]))))
 
 
 ;; newbranches is a mutable hash that maps mark sets to new branch structs
-;; use it to add bindings
+;; use it to add bindings:
+;; (define newbranches (make-newbranches))
+;; (extend-branch <syntax> (gensym) newbranches)
+;; (for ((id <ids-to-bind>))
+;;   (add-binding! ctx sym <phase> <binding> newbranches))
 (define (make-newbranches)
   (make-hash))
 
+
+;; Add a new branch to all syntax s.  Syntax with the same marks share
+;; a copy of the new branch.  Every new branch is recorded in newbranches
+;; as a place to add-binding!
 (define (extend-branch s branchid newbranches)
   (syntax-map s
     (lambda (s)
       (cond
         [(and (not (null? (syntax-branches s)))
-              (equal? branchid (branch-id (car (syntax-branches s)))))
+              (ormap (lambda (b)
+                       (and (branch? b) (eq? branchid (branch-id b))))
+                     (syntax-branches s)))
          ; already have this branch
          ;(when (identifier? s)
-         ;    (printf "adding ~a branch ~a oldbranch\n" (syntax-e s) branchid))
+         ;  (printf "adding ~a branch ~a oldbranch\n" (syntax-e s) branchid))
          s]
         [else
          (define nb (hash-ref newbranches (syntax-marks s) #f))
@@ -109,47 +107,32 @@
          ;  (printf "adding ~a branch ~a\n" (syntax-e s) branchid))
          (struct-copy syntax s
                       [branches (cons nb (syntax-branches s))])]))))
-
-
-(define (get-branch s phase id)
-  (let loop ((b (hash-ref (syntax-branches s) phase 'missing)))
-    (cond
-      [(equal? b 'missing)
-       ; this syntax doesn't have a branch in this phase (literals, parenthesis)
-       #f]
-      [(null? b)  ; hit the end
-       #f]
-      [(equal? id (branch-id (car b)))
-       (car b)]  ; found it
-      [else
-       (loop (cdr b))])))
       
 
-;; For all syntax s, if (could-bind? id s)
-;; then we are binding it, which means add bind to the list of binds
-;; in the branch identified by branchid
-(define (add-binding! id bind newbranches)
-  (define nb (hash-ref newbranches (syntax-marks id) #f))
+;; Pick the branch in newbranches with the same marks as id
+;; and insert the new binding
+(define (add-binding! ctx sym phase binding newbranches)
+  (define nb (hash-ref newbranches (syntax-marks ctx) #f))
   (when (not nb)
-    (error "add-binding! couldn't find newbranch for" id))
-  (set-branch-binds! nb (cons bind (branch-binds nb))))
+    (error "add-binding! couldn't find newbranch for" ctx))
+  (set-branch-binds! nb (cons (bind sym phase binding) (branch-binds nb))))
 
 
 (define (resolve id phase (err? #f))
-  (let loop ((b (syntax-branches id)))
+  (let loop ((b (syntax-branches id)) (p phase))
     (cond
       [(null? b)  ; ran out of branches
        (if err?
            (error "unbound identifier in phase:" phase id)
            #f)]
-      [else
-       (define bind (findf (lambda (idbind)
-                             (and (equal? (syntax-e id) (bind-id idbind))
-                                  (equal? phase (bind-phase idbind))))
+      [(branch? (car b))
+       (define bind (findf (lambda (bind)
+                             (and (eq? (syntax-e id) (bind-sym bind))
+                                  (equal? p (bind-phase bind))))
                            (branch-binds (car b))))
        (if bind
-           bind
-           (loop (cdr b)))])))
+           (bind-binding bind)
+           (loop (cdr b) p))])))
 
 ;; ------------------------------------------
 

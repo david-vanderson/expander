@@ -4,14 +4,11 @@
 ;; ----------------------------------------
 
 (define (expand-expression e)
-  (define t (namespace-syntax-introduce (datum->syntax #f e)))
-  ;(printf "t ~v\n\n" t)
-  (expand t))
+  (expand (namespace-syntax-introduce (datum->syntax #f e))))
 
 (define (compile+eval-expression e)
-  (define exp (expand-expression e))
-  ;(printf "~v\n\n" exp)
-  (define c (compile exp))
+  (define c
+    (compile (expand-expression e)))
   (values c
           (eval c)))
 
@@ -19,17 +16,8 @@
   (define-values (c v) (compile+eval-expression e))
   (when check-val
     (unless (equal? v check-val)
-      (error "check failed" v)))
+      (error "check failed")))
   v)
-
-(compile+eval-expression
- '(quote 5))
-
-(eval-expression
- #:check '(x1)
- '(let-values ([(x) 'x1]
-               [(y) 'y1])
-    (list x)))
 
 (compile+eval-expression
  '(case-lambda
@@ -39,10 +27,6 @@
 
 (compile+eval-expression
  '(lambda (x) (define-values (y) x) y))
-
-#;
-(compile+eval-expression
- '(lambda (x) y (define-values (y) x)))
 
 (compile+eval-expression
  '(lambda (x)
@@ -56,16 +40,6 @@
     ([(x) 5] [(y) (lambda (z) z)])
     (let-values ([(z) 10])
       (begin z (if (m 10) 1 2))))))
-
-"macro introduces syntax into definition context"
-(eval-expression
- #:check 'x-m
- '(letrec-syntaxes+values
-    ([(m) (lambda (stx) (quote-syntax (begin (define-values (x) 'x-m) x)))])
-    ()
-    (let-values ([(x) 'x-3])
-      (m)
-      )))
 
 "expansion not captured"
 (eval-expression
@@ -123,10 +97,6 @@
                              refs)))))])
    ()
    (gen (1 2) () ())))
-; (gen (2) ((x 1)) (x))
-; (gen () ((x 2) (x 1)) (x x))
-; (bind ((x 2) (x 1)) (x x))
-; (let-values ((x 2) (x 1)) (list x x))
 
 "use-site scopes (so not ambiguous)"
 (eval-expression
@@ -168,41 +138,3 @@
                        ()
                        v))
   (error "shouldn't get here"))
-
-
-"bound-identifier=?"
-(eval-expression
- #:check 2
- '(let-values (((x) 5))
-   (define-syntaxes (m)
-     (lambda (stx)
-       (if (bound-identifier=? (quote-syntax x) (car (cdr (syntax-e stx))) 0)
-           (quote-syntax 1)
-           (quote-syntax 2))))
-    (m x)))
-
-"nested quote-syntax"
-(eval-expression
- #:check 5
- '(let-values (((x) 5))
-    (let-syntax ((m
-                  (lambda (stx)
-                    (let-syntax ((m2
-                                  (lambda (stx)
-                                    (quote-syntax (quote-syntax x)))))
-                      (datum->syntax
-                       (quote-syntax here)
-                       (list 'let-values '(((x) 6))
-                             (m2)))))))
-      (m))))
-
-"nested definition contexts"
-(eval-expression
- #:check 5
- '(let-values ()
-   (define-syntaxes (m-x)
-     (lambda (stx)
-       (let-values ()
-         (quote-syntax x))))
-   (define-values (x) 5)
-   (m-x)))

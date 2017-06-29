@@ -7,12 +7,33 @@
          (rename-in "expand.rkt" [expand expand-in-context])
          (rename-in "compile.rkt" [compile compile-in-namespace]))
 
+;; Register core forms:
+(require "expand-expr.rkt"
+         "expand-top-level.rkt")
+
+;; Register core primitives:
+;; This list will need to be a lot longer...
+(add-core-primitive! 'syntax-e syntax-e)
+(add-core-primitive! 'datum->syntax datum->syntax)
+(add-core-primitive! 'cons cons)
+(add-core-primitive! 'list list)
+(add-core-primitive! 'car car)
+(add-core-primitive! 'cdr cdr)
+(add-core-primitive! 'null? null?)
+(add-core-primitive! 'values values)
+
+;; Fill in the (only) namespace, which ties the loop
+;; between binding the expander 
+(declare-core-top-level! (current-namespace))
+
+;; ----------------------------------------
 
 (define (namespace-syntax-introduce s)
-  (introduce s (coreb 0)))
+  ;; All top-level bindings are in the core scope:
+  (introduce s (core-branch 0)))
  
 (define (expand s)
-  (expand-in-context s (make-expand-context (current-namespace) coreb)))
+  (expand-in-context s (make-expand-context (current-namespace))))
 
 (struct compiled-expression (s-expr)
         #:property prop:custom-write
@@ -28,9 +49,9 @@
       (run-time-eval (compile-in-namespace
                       (expand-in-context
                        (namespace-syntax-introduce
-                        (datum->syntax #f s))
-                       (make-expand-context ns coreb))
-                      0
+                        (datum->syntax #f s)
+                        ns)
+                       (make-expand-context ns))
                       ns))))
 
 ;; ----------------------------------------
@@ -42,7 +63,6 @@
          syntax-property
          
          bound-identifier=?
-         free-identifier=?
          
          current-namespace
          

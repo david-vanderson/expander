@@ -19,11 +19,11 @@
                 srcloc ; source location
                 props) ; properties
         ;; Custom printer:
-;        #:property prop:custom-write
-;        (lambda (s port mode)
-;          (write-string "#<syntax:" port)
-;          (fprintf port "~.s" (syntax->datum s))
-;          (write-string ">" port))
+        #:property prop:custom-write
+        (lambda (s port mode)
+          (write-string "#<syntax:" port)
+          (fprintf port "~.s" (syntax->datum s))
+          (write-string ">" port))
   #:transparent)
 
 (define empty-marks (seteq))

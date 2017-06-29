@@ -1,13 +1,18 @@
 #lang racket/base
+(require "namespace.rkt"
+         "binding.rkt")
 
 (provide (struct-out expand-context)
          make-expand-context)
 
-(struct expand-context (coreb        ; see coreb in core.rkt
-                        phase        ; integer
-                        namespace    ; namespace for top-levels
-                        only-immediate?  ; expand only to core forms?
+(struct expand-context (phase      ; phase currently being expanded
+                        namespace  ; namespace for top-levels
+                        env        ; environment for local bindings
+                        only-immediate? ; #t => stop at core forms
                         ))
 
-(define (make-expand-context ns coreb)
-  (expand-context coreb 0 ns #f))
+(define (make-expand-context ns)
+  (expand-context 0
+                  ns
+                  empty-env
+                  #f))
